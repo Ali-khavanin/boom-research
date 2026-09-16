@@ -238,6 +238,16 @@ See [algorithm.md](docs/algorithm.md) for exactly how `research` walks the graph
 - **Per-model breakdown table** (`#breakdown`: Model / Calls / In / Out / Total / Cost) — hidden
   until toggled with `u` or `/budget`.
 
+### TUI screenshots
+
+Selecting an edge exposes its gate, retry behavior, context, tools, and prompt:
+
+![TUI graph with the frame_goal edge selected and its details visible](docs/assets/tui-edge-detail.svg)
+
+Typing `/` opens the filtered command palette:
+
+![TUI slash-command palette listing all available commands](docs/assets/tui-command-palette.svg)
+
 Key bindings:
 
 | Key | Action | Behavior |
