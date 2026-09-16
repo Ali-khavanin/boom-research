@@ -1,0 +1,78 @@
+workspace = ".ragent"
+
+[providers.openrouter]
+kind = "openrouter"
+api_key_env = "OPENROUTER_API_KEY"
+
+[providers.openai]
+kind = "openai"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.google]
+kind = "google"
+api_key_env = "GOOGLE_API_KEY"
+
+# All roles route through OpenRouter: it is the only configured provider that
+# returns real USD cost (usage.cost), so it is the only routing under which
+# the $5 cost_limit_usd below is enforceable without a hand-entered price table.
+# switch a role to OpenAI:  provider = "openai"  model = "gpt-5.6-luna"
+# switch a role to Google:  provider = "google"  model = "gemini-3.8-flash"
+# non-OpenRouter providers report no USD cost: add [prices."<provider>/<model>"]
+# with input_per_mtok/output_per_mtok, otherwise their spend shows as "calls unpriced"
+# and does not count toward cost_limit_usd.
+
+[roles.book_to_skill]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+# glm-5.3-flash is a reasoning model: it spends completion tokens on chain-of-thought
+# before emitting the actual chapter/JSON. Measured empty output at 3072 and 8192 on the
+# largest chapter (17.8k source chars needed 10.5k completion tokens) — 16384 gives headroom
+# for reasoning + real content on the biggest chapters in this book.
+max_tokens = 16384
+temperature = 0.1
+
+[roles.graph_builder]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+max_tokens = 16384
+temperature = 0.1
+
+[roles.executor]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+
+[roles.report]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+
+[roles.obsidian]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+
+[roles.refiner]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+
+[roles.judge]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+
+[search]
+backend = "ddg"
+api_key_env = "TAVILY_API_KEY"
+max_results = 6
+
+[budget]
+cost_limit_usd = 5.00
+token_limit = 400000
+warn_fraction = 0.8
+persist = true
+
+# [prices."openai/gpt-5-mini"]
+# input_per_mtok = 0.25
+# output_per_mtok = 2.00
+
+[obsidian]
+backend = "vault"
+folder = "Research"
+mcp_command = []

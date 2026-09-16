@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "entry": "start",
+  "nodes": [
+    {"id": "start", "title": "Start", "description": "Receive and frame the research query."},
+    {"id": "goal", "title": "Goal", "description": "State the research objective and scope."},
+    {"id": "what_has_been_done", "title": "What Has Been Done", "description": "Find and synthesize prior work."},
+    {"id": "limitations", "title": "Limitations", "description": "Identify limitations in prior work."},
+    {"id": "gaps", "title": "Gaps", "description": "Derive actionable research gaps."},
+    {"id": "feasibility", "title": "Feasibility", "description": "Assess data and method availability."},
+    {"id": "quick_test", "title": "Quick Test", "description": "Design a fast discriminating test."},
+    {"id": "done", "title": "Done", "description": "Research report and notes are complete.", "terminal": true}
+  ],
+  "edges": [
+    {
+      "id": "frame_goal", "source": "start", "target": "goal",
+      "prompt_template": "For the query {query}, write a concrete research goal with scope, intended contribution, success criteria, and exclusions. Current artifacts: {artifacts}. Last failure: {last_failure}",
+      "termination_metric": {"kind": "min_words", "key": "goal", "n": 60},
+      "produces": "goal"
+    },
+    {
+      "id": "review_prior_work", "source": "goal", "target": "what_has_been_done",
+      "prompt_template": "Research prior work relevant to {query} and the goal. Use search and fetch, cite at least three distinct source URLs directly in the synthesis, and save a note when useful. Artifacts: {artifacts}. Last failure: {last_failure}",
+      "tool_set": ["browser.search", "browser.fetch", "obsidian.note"],
+      "termination_metric": {"kind": "has_citations", "key": "prior_work", "n": 3},
+      "produces": "prior_work", "on_fail": "goal"
+    },
+    {
+      "id": "identify_limitations", "source": "what_has_been_done", "target": "limitations",
+      "prompt_template": "From the cited prior work for {query}, identify at least three concrete limitations as Markdown list items. Fetch sources when needed. Artifacts: {artifacts}. Last failure: {last_failure}",
+      "tool_set": ["browser.fetch"],
+      "termination_metric": {"kind": "min_items", "key": "limitations", "n": 3},
+      "produces": "limitations", "on_fail": "what_has_been_done"
+    },
+    {
+      "id": "derive_gaps", "source": "limitations", "target": "gaps",
+      "prompt_template": "Turn the limitations into at least three specific research gaps for {query}. Use Markdown list items and explain why each matters. Artifacts: {artifacts}. Last failure: {last_failure}",
+      "termination_metric": {"kind": "min_items", "key": "gaps", "n": 3},
+      "produces": "gaps", "on_fail": "limitations"
+    },
+    {
+      "id": "assess_feasibility", "source": "gaps", "target": "feasibility",
+      "prompt_template": "Assess feasibility of every gap for {query}. For each gap give a data availability verdict and method availability verdict, using search where needed. Artifacts: {artifacts}. Last failure: {last_failure}",
+      "tool_set": ["browser.search"],
+      "termination_metric": {"kind": "llm_rubric", "key": "feasibility", "rubric": "each gap has data/method availability verdict"},
+      "produces": "feasibility", "on_fail": "gaps"
+    },
+    {
+      "id": "design_quick_test", "source": "feasibility", "target": "quick_test",
+      "prompt_template": "Design a quick discriminating test for the best feasible gap for {query}. Specify hypothesis, data, method, baseline, measurement, stopping rule, risks, and interpretation in at least 120 words. Artifacts: {artifacts}. Last failure: {last_failure}",
+      "termination_metric": {"kind": "min_words", "key": "quick_test", "n": 120},
+      "produces": "quick_test", "on_fail": "feasibility"
+    },
+    {
+      "id": "publish_results", "source": "quick_test", "target": "done",
+      "prompt_template": "Generate the final report and create an Obsidian research note for {query}. Use the report and note tools. Artifacts: {artifacts}. Last failure: {last_failure}",
+      "tool_set": ["report.generate", "obsidian.note"],
+      "termination_metric": {"kind": "artifact_exists", "key": "report_path"},
+      "produces": "report_path", "on_fail": "quick_test"
+    }
+  ]
+}
