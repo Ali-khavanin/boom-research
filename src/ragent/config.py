@@ -40,7 +40,17 @@ class RoleCfg(BaseModel):
     provider: str
     model: str
     temperature: float = 0.2
-    max_tokens: int = 8192
+    max_tokens: int = Field(default=8192, ge=1)
+    reasoning_max_tokens: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_reasoning_budget(self) -> RoleCfg:
+        if (
+            self.reasoning_max_tokens is not None
+            and self.reasoning_max_tokens >= self.max_tokens
+        ):
+            raise ValueError("reasoning_max_tokens must be less than max_tokens")
+        return self
 
 
 class SearchCfg(BaseModel):
@@ -54,6 +64,9 @@ class ObsidianCfg(BaseModel):
     vault_path: Path | None = None
     folder: str = "Research"
     mcp_command: list[str] = Field(default_factory=list)
+    layout: Literal["note", "bundle"] = "note"
+    tags: list[str] = Field(default_factory=lambda: ["research"])
+    related_notes: list[str] = Field(default_factory=list)
 
 
 class ModelPriceCfg(BaseModel):
@@ -61,11 +74,23 @@ class ModelPriceCfg(BaseModel):
     output_per_mtok: float = Field(ge=0)
 
 
+class ResearchCfg(BaseModel):
+    query: str | None = None
+    graph_path: Path | None = None
+    skill_path: Path | None = None
+    instructions: str = ""
+    min_sources: int = Field(default=3, ge=1)
+    max_steps: int = Field(default=24, ge=1)
+    report: bool = True
+    obsidian: bool = True
+
+
 class BudgetCfg(BaseModel):
     token_limit: int | None = Field(default=None, ge=1)
     cost_limit_usd: float | None = Field(default=None, gt=0)
     warn_fraction: float = Field(default=0.8, gt=0, le=1)
     persist: bool = True
+    strict: bool = False
 
 
 class Config(BaseModel):
@@ -75,16 +100,39 @@ class Config(BaseModel):
     search: SearchCfg = Field(default_factory=SearchCfg)
     obsidian: ObsidianCfg = Field(default_factory=ObsidianCfg)
     budget: BudgetCfg = Field(default_factory=BudgetCfg)
+    research: ResearchCfg = Field(default_factory=ResearchCfg)
     prices: dict[str, ModelPriceCfg] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def validate_role_providers(self) -> "Config":
+    def validate_contract(self) -> Config:
         missing_roles = [name for name in ROLE_NAMES if name not in self.roles]
         if missing_roles:
             raise ValueError(f"missing role configuration: {', '.join(missing_roles)}")
-        unknown = sorted({role.provider for role in self.roles.values()} - self.providers.keys())
+        unknown = sorted(
+            {role.provider for role in self.roles.values()} - self.providers.keys()
+        )
         if unknown:
             raise ValueError(f"roles reference unknown providers: {', '.join(unknown)}")
+        if self.budget.strict:
+            if not self.budget.persist or self.budget.cost_limit_usd is None:
+                raise ValueError(
+                    "strict budget requires persist=true and a positive cost_limit_usd"
+                )
+            non_openrouter = sorted(
+                name
+                for name, role in self.roles.items()
+                if self.providers[role.provider].kind != "openrouter"
+            )
+            if non_openrouter:
+                raise ValueError(
+                    "strict budget requires OpenRouter for every role: "
+                    + ", ".join(non_openrouter)
+                )
+        if self.obsidian.layout == "bundle":
+            if self.obsidian.backend == "mcp":
+                raise ValueError("bundle export requires the vault backend")
+            if not self.research.report:
+                raise ValueError("bundle export requires research.report=true")
         return self
 
 
@@ -108,8 +156,22 @@ DEFAULT_CONFIG: dict = {
         for role in ROLE_NAMES
     },
     "search": {"backend": "ddg", "api_key_env": "TAVILY_API_KEY", "max_results": 6},
-    "obsidian": {"backend": "vault", "folder": "Research", "mcp_command": []},
-    "budget": {"warn_fraction": 0.8, "persist": True},
+    "obsidian": {
+        "backend": "vault",
+        "folder": "Research",
+        "mcp_command": [],
+        "layout": "note",
+        "tags": ["research"],
+        "related_notes": [],
+    },
+    "budget": {"warn_fraction": 0.8, "persist": True, "strict": False},
+    "research": {
+        "instructions": "",
+        "min_sources": 3,
+        "max_steps": 24,
+        "report": True,
+        "obsidian": True,
+    },
     "prices": {},
 }
 

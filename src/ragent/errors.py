@@ -16,3 +16,15 @@ class GraphError(RagentError):
 
 class BudgetError(RagentError):
     """A token or cost budget was exhausted."""
+
+
+class PreflightError(RagentError):
+    """Free admission checks failed before a research run."""
+
+
+class ExportError(RagentError):
+    """A configured local or remote export could not be verified."""
+
+
+class VerificationError(RagentError):
+    """Persisted run evidence did not satisfy its recorded contract."""

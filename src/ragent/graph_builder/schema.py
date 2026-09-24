@@ -13,6 +13,7 @@ class RoleOverride(BaseModel):
     model: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
+    reasoning_max_tokens: int | None = None
 
 
 class Metric(BaseModel):
@@ -30,7 +31,7 @@ class Metric(BaseModel):
     rubric: str | None = None
 
     @model_validator(mode="after")
-    def validate_parameters(self) -> "Metric":
+    def validate_parameters(self) -> Metric:
         if self.kind in {"min_words", "min_items", "has_citations"} and self.n is None:
             raise ValueError(f"metric {self.kind} requires n")
         if self.kind == "regex" and not self.pattern:

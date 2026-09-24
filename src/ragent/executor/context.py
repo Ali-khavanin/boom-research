@@ -19,7 +19,9 @@ class RunContext:
     artifacts: dict[str, str]
     citations: list[dict[str, str]]
     cfg: Config
-    trace: "TraceLog"
+    trace: TraceLog
+    skill_text: str = ""
+    source_aliases: dict[str, str] = field(default_factory=dict)
     attempts: Counter[str] = field(default_factory=Counter)
     last_failure: str = ""
 
