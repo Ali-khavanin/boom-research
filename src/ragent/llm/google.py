@@ -37,7 +37,9 @@ class GoogleProvider:
             if delay:
                 time.sleep(delay)
             try:
-                response = self.client.post(url, params={"key": self.api_key}, json=payload)
+                response = self.client.post(
+                    url, params={"key": self.api_key}, json=payload
+                )
             except httpx.HTTPError as exc:
                 last_error = str(exc)
                 if attempt < 3:
@@ -56,7 +58,9 @@ class GoogleProvider:
                 return response.json()
             except ValueError as exc:
                 raise ProviderError(f"Google returned invalid JSON: {exc}") from exc
-        raise ProviderError(f"Google provider request failed after retries: {last_error}")
+        raise ProviderError(
+            f"Google provider request failed after retries: {last_error}"
+        )
 
     def complete(
         self,
@@ -65,10 +69,13 @@ class GoogleProvider:
         messages: list[Message],
         temperature: float,
         max_tokens: int,
+        reasoning_max_tokens: int | None = None,
         json_schema: dict[str, Any] | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> Completion:
-        system_parts = [message.content for message in messages if message.role == "system"]
+        system_parts = [
+            message.content for message in messages if message.role == "system"
+        ]
         contents = [
             {
                 "role": "model" if message.role == "assistant" else "user",
@@ -90,7 +97,9 @@ class GoogleProvider:
             )
         payload: dict[str, Any] = {"contents": contents, "generationConfig": generation}
         if system_parts:
-            payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
+            payload["systemInstruction"] = {
+                "parts": [{"text": "\n\n".join(system_parts)}]
+            }
         if tools:
             declarations = []
             for tool in tools:
@@ -107,7 +116,9 @@ class GoogleProvider:
         try:
             parts = data["candidates"][0]["content"]["parts"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise ProviderError(f"Google returned an unexpected response: {data!r}") from exc
+            raise ProviderError(
+                f"Google returned an unexpected response: {data!r}"
+            ) from exc
         text: list[str] = []
         calls: list[ToolCall] = []
         for part in parts:
