@@ -100,6 +100,11 @@ def _render(edge: Edge, node: Node, ctx: RunContext) -> str:
         + values["instructions"]
         + "\n\nCanonical fetched-source index:\n"
         + source_index
+        + "\n\nCitation rule: never write, quote, or link a URL you have not successfully "
+        "fetched with browser.fetch this run. Search results are for choosing what to fetch "
+        "next, not evidence — do not mention a search-result URL in your output until you "
+        "have fetched it. Only URLs present in the canonical fetched-source index above may "
+        "appear anywhere in your output."
     )
 
 
