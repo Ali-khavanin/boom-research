@@ -1,23 +1,42 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from rich.text import Text
-
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
-from textual.widgets import DataTable, Footer, Header, Input, Markdown, OptionList, RichLog, Static, Tree
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Markdown,
+    OptionList,
+    RichLog,
+    Static,
+    Tree,
+)
 
 from ragent.book_to_skill import build as build_skill
 from ragent.config import Config
 from ragent.errors import BudgetError
 from ragent.executor.runner import run
-from ragent.graph_builder import Edge, Graph, Node, audit, build_graph, load_seed, to_mermaid, write_mermaid
+from ragent.graph_builder import (
+    Edge,
+    Graph,
+    Node,
+    audit,
+    build_graph,
+    load_seed,
+    to_mermaid,
+    write_mermaid,
+)
 from ragent.llm import get_llm
 from ragent.llm.usage import ModelPrice, UsageLedger, get_ledger
 
@@ -92,11 +111,11 @@ def _edge_detail(edge: Edge, graph: Graph) -> str:
         verification += f', rubric: "{metric.rubric}"'
 
     if edge.on_fail:
-        failure = f"routes back to `{edge.on_fail}` after {edge.max_attempts} failed attempts"
-    else:
         failure = (
-            f"retries this edge in place; hard error after {edge.max_attempts + 1} failures"
+            f"routes back to `{edge.on_fail}` after {edge.max_attempts} failed attempts"
         )
+    else:
+        failure = f"retries this edge in place; hard error after {edge.max_attempts + 1} failures"
 
     tools = ", ".join(f"`{tool}`" for tool in edge.tool_set) or "none — prompt only"
     if edge.precondition is None:
@@ -171,7 +190,6 @@ def _node_detail(node: Node, graph: Graph) -> str:
     return "\n".join(lines)
 
 
-
 class ResearchApp(App[None]):
     CSS = """
     #budget { height: 1; padding: 0 1; background: $panel; }
@@ -210,11 +228,15 @@ class ResearchApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("", id="budget")
-        yield CommandInput(placeholder="Research query (or PDF path for Book)", id="query")
+        yield CommandInput(
+            placeholder="Research query (or PDF path for Book)", id="query"
+        )
         yield OptionList(id="palette")
         with Horizontal(id="top"):
             yield DataTable(id="models")
-            yield Input(placeholder="role=provider/model, then Enter", id="model_override")
+            yield Input(
+                placeholder="role=provider/model, then Enter", id="model_override"
+            )
         with Horizontal(id="body"):
             yield Tree("Research graph", id="graph")
             with Vertical(id="right"):
@@ -228,6 +250,8 @@ class ResearchApp(App[None]):
         table.add_columns("Role", "Provider", "Model")
         for role, value in self.cfg.roles.items():
             table.add_row(role, value.provider, value.model, key=role)
+        query = self.query_one("#query", CommandInput)
+        query.value = self.cfg.research.query or ""
         self.ledger = get_ledger(self.cfg)
         breakdown = self.query_one("#breakdown", DataTable)
         breakdown.add_columns("Model", "Calls", "In", "Out", "Total", "Cost")
@@ -239,8 +263,15 @@ class ResearchApp(App[None]):
         self._load_graph()
 
     def _load_graph(self) -> None:
-        path = self.cfg.workspace / "graph.json"
-        self.graph = Graph.model_validate_json(path.read_text(encoding="utf-8")) if path.exists() else load_seed()
+        configured = self.cfg.research.graph_path
+        path = configured or self.cfg.workspace / "graph.json"
+        if configured is not None and not path.exists():
+            raise FileNotFoundError(f"configured research graph not found: {path}")
+        self.graph = (
+            Graph.model_validate_json(path.read_text(encoding="utf-8"))
+            if path.exists()
+            else load_seed()
+        )
         self._render_graph_tree()
 
     def _render_graph_tree(self) -> None:
@@ -289,14 +320,12 @@ class ResearchApp(App[None]):
             self._hide_palette()
             return
 
-        matches = [command for command in _COMMANDS if command.keyword.startswith(typed)]
+        matches = [
+            command for command in _COMMANDS if command.keyword.startswith(typed)
+        ]
         if not matches:
             matches = sorted(
-                (
-                    command
-                    for command in _COMMANDS
-                    if typed.startswith(command.keyword)
-                ),
+                (command for command in _COMMANDS if typed.startswith(command.keyword)),
                 key=lambda command: len(command.keyword),
                 reverse=True,
             )
@@ -351,9 +380,7 @@ class ResearchApp(App[None]):
         query.cursor_position = len(value)
         self._refresh_palette(value)
 
-    def on_option_list_option_selected(
-        self, event: OptionList.OptionSelected
-    ) -> None:
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id != "palette":
             return
         self._complete_palette(event.option_index)
@@ -389,19 +416,48 @@ class ResearchApp(App[None]):
         key = event.get("artifact_key")
         case_id = event.get("case_id")
         if key and case_id:
-            path = self.cfg.workspace / "runs" / str(case_id) / "artifacts" / f"{key}.md"
+            path = (
+                self.cfg.workspace / "runs" / str(case_id) / "artifacts" / f"{key}.md"
+            )
             if path.exists():
-                self.post_message(ArtifactMsg(str(key), path.read_text(encoding="utf-8")))
+                self.post_message(
+                    ArtifactMsg(str(key), path.read_text(encoding="utf-8"))
+                )
 
     def on_transition_msg(self, message: TransitionMsg) -> None:
         event = message.event
-        metric = event.get("metric") or {}
+        log = self.query_one("#log", RichLog)
+        kind = event.get("event")
+        if kind == "search":
+            log.write(
+                f"[cyan]search:[/cyan] {event.get('result_count', 0)} results "
+                f"for {event.get('query', '')}"
+            )
+            return
+        if kind == "usage":
+            log.write(
+                f"[blue]usage:[/blue] {event.get('role')} "
+                f"${event.get('cost_usd') or 0:.6f}"
+            )
+            return
+        if kind == "complete":
+            log.write(
+                f"[green]complete[/green] report={event.get('report_path') or 'disabled'} "
+                f"index={event.get('obsidian_index_path') or 'disabled'}"
+            )
+            return
+        metric = event.get("metric")
+        if not isinstance(metric, dict):
+            detail = event.get("detail", "")
+            color = "red" if kind == "error" else "yellow"
+            log.write(f"[{color}]{detail}[/{color}]")
+            return
         passed = bool(metric.get("passed"))
         color = "green" if passed else "red"
         activity = str(event.get("activity", ""))
         target = str(event.get("target", ""))
-        self.query_one("#log", RichLog).write(
-            f"[{color}]{activity} → {target}: {metric.get('detail', event.get('detail', ''))}[/{color}]"
+        log.write(
+            f"[{color}]{activity} → {target}: {metric.get('detail', '')}[/{color}]"
         )
         edge_id = str(event.get("edge_id", ""))
         if edge_id in self.edge_rows:
@@ -412,7 +468,9 @@ class ResearchApp(App[None]):
             tree.select_node(self.node_rows[target])
 
     def on_artifact_msg(self, message: ArtifactMsg) -> None:
-        self.query_one("#artifact", Markdown).update(f"# {message.key}\n\n{message.text}")
+        self.query_one("#artifact", Markdown).update(
+            f"# {message.key}\n\n{message.text}"
+        )
 
     def on_usage_msg(self, message: UsageMsg) -> None:
         self._refresh_budget()
@@ -429,11 +487,15 @@ class ResearchApp(App[None]):
             log.write(f"book: {event['chapters']} chapters from {event['pdf']}")
         elif kind == "chapter_start":
             suffix = " (cached)" if event.get("cached") else ""
-            log.write(f"chapter {event['index']}/{event['total']}: {event['title']}{suffix}")
+            log.write(
+                f"chapter {event['index']}/{event['total']}: {event['title']}{suffix}"
+            )
         elif kind == "chapter_done":
             log.write(f"  wrote {event['path']}")
         elif kind == "skill_start":
-            log.write("SKILL.md: cached" if event.get("cached") else "SKILL.md: synthesizing")
+            log.write(
+                "SKILL.md: cached" if event.get("cached") else "SKILL.md: synthesizing"
+            )
         elif kind == "skill_done":
             log.write(f"SKILL.md: {event['path']}")
         elif kind == "graph_start":
@@ -443,7 +505,9 @@ class ResearchApp(App[None]):
         elif kind == "graph_delta":
             tree = self.query_one("#graph", Tree)
             for node in event["new_nodes"]:
-                branch = tree.root.add(f"[green]{node['id']} — {node['title']}[/green]", data=node["id"])
+                branch = tree.root.add(
+                    f"[green]{node['id']} — {node['title']}[/green]", data=node["id"]
+                )
                 self.node_rows[node["id"]] = branch
             for edge in event["new_edges"]:
                 parent = self.node_rows.get(edge["source"], tree.root)
@@ -465,7 +529,9 @@ class ResearchApp(App[None]):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(graph.model_dump_json(indent=2), encoding="utf-8")
             write_mermaid(graph, self.cfg.workspace / "graph.mmd")
-            self.post_message(ArtifactMsg("graph.mmd", "```mermaid\n" + to_mermaid(graph) + "```"))
+            self.post_message(
+                ArtifactMsg("graph.mmd", "```mermaid\n" + to_mermaid(graph) + "```")
+            )
             color = "green" if event["audit_ok"] else "red"
             detail = "ok" if event["audit_ok"] else event["detail"]
             log.write(f"[{color}]audit: {detail}[/{color}]")
@@ -552,7 +618,12 @@ class ResearchApp(App[None]):
                 log.write("[green]budget: limits cleared[/green]")
             elif sub == "reset":
                 self.ledger.reset_session()
-                log.write("[green]budget: session totals reset[/green]")
+                suffix = (
+                    "; strict campaign exposure is unchanged"
+                    if self.ledger.strict
+                    else ""
+                )
+                log.write(f"[green]budget: session totals reset{suffix}[/green]")
             elif sub == "price":
                 key = args[1]
                 input_price = float(args[2])
@@ -564,7 +635,7 @@ class ResearchApp(App[None]):
                 log.write(self._BUDGET_HELP)
                 return
             self._refresh_budget()
-        except (ValueError, IndexError) as exc:
+        except (ValueError, IndexError, BudgetError) as exc:
             log.write(f"[red]budget: {exc}[/red]")
             log.write(self._BUDGET_HELP)
 
@@ -581,7 +652,9 @@ class ResearchApp(App[None]):
     def action_run(self) -> None:
         query = self.query_one("#query", Input).value.strip()
         if query.startswith("/"):
-            self.post_message(TransitionMsg({"detail": "slash commands run on Enter, not r"}))
+            self.post_message(
+                TransitionMsg({"detail": "slash commands run on Enter, not r"})
+            )
             return
         if not query:
             self.post_message(TransitionMsg({"detail": "enter a research query"}))
@@ -597,11 +670,21 @@ class ResearchApp(App[None]):
         raw = self.query_one("#query", Input).value.strip()
         path = Path(raw).expanduser()
         if not path.exists():
-            self.post_message(TransitionMsg({"detail": "Book binding uses the query field as a PDF path"}))
+            self.post_message(
+                TransitionMsg(
+                    {"detail": "Book binding uses the query field as a PDF path"}
+                )
+            )
             return
         try:
-            bundle = build_skill(path, self.cfg.workspace / "skills", get_llm("book_to_skill", cfg=self.cfg))
-            self.post_message(ArtifactMsg("SKILL.md", bundle.skill_file.read_text(encoding="utf-8")))
+            bundle = build_skill(
+                path,
+                self.cfg.workspace / "skills",
+                get_llm("book_to_skill", cfg=self.cfg),
+            )
+            self.post_message(
+                ArtifactMsg("SKILL.md", bundle.skill_file.read_text(encoding="utf-8"))
+            )
         except Exception as exc:
             self.post_message(TransitionMsg({"detail": f"{type(exc).__name__}: {exc}"}))
 
@@ -624,7 +707,9 @@ class ResearchApp(App[None]):
     def action_pipeline(self) -> None:
         value = self.query_one("#query", Input).value.strip()
         if not value or value.startswith("/"):
-            self.query_one("#log", RichLog).write("pipeline: type /book <pdf-path> and press Enter")
+            self.query_one("#log", RichLog).write(
+                "pipeline: type /book <pdf-path> and press Enter"
+            )
             return
         self.run_pipeline(value)
 
@@ -634,9 +719,18 @@ class ResearchApp(App[None]):
         skills = self.cfg.workspace / "skills"
         emit = lambda event: self.post_message(PipelineMsg(event))
         try:
-            bundle = build_skill(pdf, skills, get_llm("book_to_skill", cfg=self.cfg), on_event=emit)
-            self.post_message(ArtifactMsg("SKILL.md", bundle.skill_file.read_text(encoding="utf-8")))
-            build_graph(skills, get_llm("graph_builder", cfg=self.cfg), load_seed(), on_event=emit)
+            bundle = build_skill(
+                pdf, skills, get_llm("book_to_skill", cfg=self.cfg), on_event=emit
+            )
+            self.post_message(
+                ArtifactMsg("SKILL.md", bundle.skill_file.read_text(encoding="utf-8"))
+            )
+            build_graph(
+                skills,
+                get_llm("graph_builder", cfg=self.cfg),
+                load_seed(),
+                on_event=emit,
+            )
         except BudgetError as exc:
             emit({"event": "pipeline_error", "detail": f"budget stop: {exc}"})
         except Exception as exc:

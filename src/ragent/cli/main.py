@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
@@ -17,8 +16,16 @@ from rich.tree import Tree
 from ragent.book_to_skill import build as build_skill
 from ragent.config import DEFAULT_CONFIG, Config, load_config, require_api_key
 from ragent.errors import GraphError, RagentError
-from ragent.executor.runner import run
-from ragent.graph_builder import Graph, Metric, audit, build_graph, load_seed, to_mermaid, write_mermaid
+from ragent.executor.preflight import preflight
+from ragent.executor.runner import prepare_graph, run
+from ragent.executor.verification import verify_run
+from ragent.graph_builder import (
+    Graph,
+    audit,
+    build_graph,
+    load_seed,
+    write_mermaid,
+)
 from ragent.llm import get_ledger, get_llm
 from ragent.trajectories import load_runs, to_csv
 from ragent.wiki_refiner import gated, load_proposal, merge, propose
@@ -57,11 +64,25 @@ def _graph(path: Path) -> Graph:
         raise GraphError(f"invalid graph {path}: {exc}") from exc
 
 
+def _run_dir(workspace: Path, run_id: str) -> Path:
+    if not run_id or Path(run_id).name != run_id or run_id in {".", ".."}:
+        raise RagentError(f"invalid run id: {run_id!r}")
+    root = (workspace / "runs").resolve()
+    path = (root / run_id).resolve()
+    if not path.is_relative_to(root):
+        raise RagentError(f"run id escapes workspace: {run_id!r}")
+    return path
+
+
 def _print_audit(graph: Graph) -> bool:
     result = audit(graph)
     console.print(f"entry={result.entry}")
-    console.print(f"done reachable from {result.done_reachable_count}/{result.node_count} nodes")
-    console.print("dead ends: " + (", ".join(result.dead_ends) if result.dead_ends else "none"))
+    console.print(
+        f"done reachable from {result.done_reachable_count}/{result.node_count} nodes"
+    )
+    console.print(
+        "dead ends: " + (", ".join(result.dead_ends) if result.dead_ends else "none")
+    )
     for finding in result.findings:
         style = "red" if finding.level == "error" else "green"
         console.print(f"[{style}]{finding.level}: {finding.detail}[/{style}]")
@@ -71,9 +92,16 @@ def _print_audit(graph: Graph) -> bool:
 @app.callback()
 def main(
     ctx: typer.Context,
-    config: Annotated[Path | None, typer.Option("--config", help="TOML configuration path")] = None,
-    workspace: Annotated[Path | None, typer.Option("--workspace", help="Workspace override")] = None,
-    model: Annotated[list[str] | None, typer.Option("--model", help="Repeatable role=provider/model override")] = None,
+    config: Annotated[
+        Path | None, typer.Option("--config", help="TOML configuration path")
+    ] = None,
+    workspace: Annotated[
+        Path | None, typer.Option("--workspace", help="Workspace override")
+    ] = None,
+    model: Annotated[
+        list[str] | None,
+        typer.Option("--model", help="Repeatable role=provider/model override"),
+    ] = None,
 ) -> None:
     try:
         cfg = load_config(config, workspace=workspace, model_overrides=model)
@@ -106,11 +134,17 @@ def _ping_provider(name: str, state: State) -> tuple[bool, str]:
     key = require_api_key(name, provider)
     headers = {"Authorization": f"Bearer {key}"}
     if provider.kind == "google":
-        url = (provider.base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/") + "/models"
+        url = (
+            provider.base_url or "https://generativelanguage.googleapis.com/v1beta"
+        ).rstrip("/") + "/models"
         params = {"key": key}
         headers = {}
     else:
-        default = "https://openrouter.ai/api/v1" if provider.kind == "openrouter" else "https://api.openai.com/v1"
+        default = (
+            "https://openrouter.ai/api/v1"
+            if provider.kind == "openrouter"
+            else "https://api.openai.com/v1"
+        )
         url = (provider.base_url or default).rstrip("/") + "/models"
         params = {}
     try:
@@ -133,7 +167,11 @@ def providers_check(ctx: typer.Context) -> None:
     table = Table("Provider", "Kind", "Status")
     for name, provider in state.cfg.providers.items():
         ok, detail = status[name]
-        table.add_row(name, provider.kind, ("[green]ok[/green] " if ok else "[red]failed[/red] ") + detail)
+        table.add_row(
+            name,
+            provider.kind,
+            ("[green]ok[/green] " if ok else "[red]failed[/red] ") + detail,
+        )
     console.print(table)
     roles = Table("Role", "Provider", "Model")
     for role, value in state.cfg.roles.items():
@@ -158,13 +196,21 @@ def book_command(
     def progress(event: dict) -> None:
         if event["event"] == "chapter_start":
             suffix = " (cached)" if event["cached"] else ""
-            console.print(f"chapter {event['index']}/{event['total']}: {event['title']}{suffix}")
+            console.print(
+                f"chapter {event['index']}/{event['total']}: {event['title']}{suffix}"
+            )
         elif event["event"] == "chapter_done":
             console.print(f"  → {event['path']}")
         elif event["event"] == "skill_start":
             console.print("synthesizing SKILL.md")
 
-    bundle = build_skill(pdf, target, get_llm("book_to_skill", cfg=state.cfg), force=force, on_event=progress)
+    bundle = build_skill(
+        pdf,
+        target,
+        get_llm("book_to_skill", cfg=state.cfg),
+        force=force,
+        on_event=progress,
+    )
     console.print(f"skill: {bundle.skill_file}")
     console.print(f"chapters: {len(bundle.chapter_files)}")
     console.print(get_ledger(state.cfg).status_line())
@@ -187,7 +233,9 @@ def graph_build(
         def progress(event: dict) -> None:
             nonlocal last_graph
             if event["event"] == "graph_chapter_start":
-                console.print(f"chapter {event['index']}/{event['total']} {event['chapter']}")
+                console.print(
+                    f"chapter {event['index']}/{event['total']} {event['chapter']}"
+                )
             elif event["event"] == "graph_delta":
                 console.print(
                     f"+{len(event['new_nodes'])} nodes +{len(event['new_edges'])} edges "
@@ -232,9 +280,14 @@ def graph_show(
     nodes = [graph.node(node)] if node else graph.nodes
     root = Tree(f"graph v{graph.version} entry={graph.entry}")
     for item in nodes:
-        branch = root.add(f"[bold]{item.id}[/bold] — {item.title}" + (" [terminal]" if item.terminal else ""))
+        branch = root.add(
+            f"[bold]{item.id}[/bold] — {item.title}"
+            + (" [terminal]" if item.terminal else "")
+        )
         for edge in graph.out_edges(item.id):
-            branch.add(f"{edge.id} → {edge.target}  metric={edge.termination_metric.kind}:{edge.termination_metric.key}")
+            branch.add(
+                f"{edge.id} → {edge.target}  metric={edge.termination_metric.kind}:{edge.termination_metric.key}"
+            )
     console.print(root)
 
 
@@ -251,55 +304,139 @@ def graph_audit(
 @app.command("research")
 def research_command(
     ctx: typer.Context,
-    query: str,
+    query: Annotated[str | None, typer.Argument(help="Research query")] = None,
     graph_path: Annotated[Path | None, typer.Option("--graph")] = None,
     start: Annotated[str | None, typer.Option("--start")] = None,
-    max_steps: Annotated[int, typer.Option("--max-steps", min=1)] = 24,
-    report: Annotated[bool, typer.Option("--report/--no-report")] = True,
-    obsidian: Annotated[bool, typer.Option("--obsidian/--no-obsidian")] = True,
+    max_steps: Annotated[int | None, typer.Option("--max-steps", min=1)] = None,
+    report: Annotated[bool | None, typer.Option("--report/--no-report")] = None,
+    obsidian: Annotated[bool | None, typer.Option("--obsidian/--no-obsidian")] = None,
+    preflight_only: Annotated[
+        bool, typer.Option("--preflight", help="Run free admission checks only")
+    ] = False,
 ) -> None:
     state = _state(ctx)
-    graph = _graph(graph_path or state.cfg.workspace / "graph.json").model_copy(deep=True)
-    for edge in graph.edges:
-        if not obsidian:
-            edge.tool_set = [name for name in edge.tool_set if name != "obsidian.note"]
-        if not report and "report.generate" in edge.tool_set:
-            edge.tool_set = [name for name in edge.tool_set if name != "report.generate"]
-            edge.produces = "publication"
-            edge.termination_metric = Metric(kind="artifact_exists", key="quick_test")
+    resolved_query = (query if query is not None else state.cfg.research.query) or ""
+    if not resolved_query.strip():
+        raise typer.BadParameter(
+            "research query is required as an argument or research.query"
+        )
+    resolved_graph_path = (
+        graph_path
+        or state.cfg.research.graph_path
+        or state.cfg.workspace / "graph.json"
+    )
+    graph = _graph(resolved_graph_path)
+    resolved_report = report if report is not None else state.cfg.research.report
+    resolved_obsidian = (
+        obsidian if obsidian is not None else state.cfg.research.obsidian
+    )
+    prepared = prepare_graph(
+        graph,
+        state.cfg,
+        report=resolved_report,
+        obsidian=resolved_obsidian,
+    )
+    if preflight_only:
+        effective = state.cfg.model_copy(deep=True)
+        effective.research.report = resolved_report
+        effective.research.obsidian = resolved_obsidian
+        console.print_json(
+            json.dumps(preflight(prepared, effective), ensure_ascii=False)
+        )
+        return
+
     def progress(event: dict) -> None:
+        if event.get("event") == "usage":
+            console.print(
+                f"usage {event.get('role')}: ${event.get('cost_usd') or 0:.6f}"
+            )
+            return
+        if event.get("event") == "search":
+            console.print(
+                f"search {event.get('result_count', 0)} results: {event.get('query', '')}"
+            )
+            return
         metric = event.get("metric")
         if metric:
             style = "green" if metric.get("passed") else "red"
-            console.print(f"[{style}]{event.get('activity')} → {event.get('target')}: {metric.get('detail')}[/{style}]")
-    result = run(graph, query, state.cfg, start=start, max_steps=max_steps, on_event=progress)
-    console.print(f"run {result.run_id}: reached {result.final_node} in {result.steps} transitions")
+            console.print(
+                f"[{style}]{event.get('activity')} → {event.get('target')}: "
+                f"{metric.get('detail')}[/{style}]"
+            )
+
+    result = run(
+        graph,
+        resolved_query,
+        state.cfg,
+        start=start,
+        max_steps=max_steps,
+        report=report,
+        obsidian=obsidian,
+        on_event=progress,
+    )
+    console.print(
+        f"run {result.run_id}: reached {result.final_node} in {result.steps} transitions"
+    )
     if result.report_path:
         console.print(f"report: {result.report_path}")
-    console.print(get_ledger(state.cfg).status_line())
+    if result.obsidian_index_path:
+        console.print(f"index: {result.obsidian_index_path}")
+    snapshot = get_ledger(state.cfg).snapshot()
+    console.print(
+        f"campaign actual ${snapshot['lifetime']['cost_usd']:.6f}; "
+        f"reserved ${snapshot['reserved_cost_usd']:.6f}; "
+        f"verified={bool(result.verification and result.verification['passed'])}"
+    )
 
 
 @runs_app.command("list")
 def runs_list(ctx: typer.Context) -> None:
-    runs = load_runs(_state(ctx).cfg.workspace)
-    table = Table("Run", "Transitions", "Final target")
+    state = _state(ctx)
+    runs = load_runs(state.cfg.workspace)
+    table = Table("Run", "Transitions", "State")
     for run_id, events in sorted(runs.items(), reverse=True):
         transitions = [event for event in events if "edge_id" in event]
-        target = transitions[-1].get("target", "") if transitions else ""
-        table.add_row(run_id, str(len(transitions)), str(target))
+        metadata_path = _run_dir(state.cfg.workspace, run_id) / "run.json"
+        if metadata_path.is_file():
+            try:
+                status = str(
+                    json.loads(metadata_path.read_text(encoding="utf-8")).get(
+                        "status", ""
+                    )
+                )
+            except (OSError, json.JSONDecodeError):
+                status = "corrupt"
+        else:
+            status = str(transitions[-1].get("target", "")) if transitions else ""
+        table.add_row(run_id, str(len(transitions)), status)
     console.print(table)
 
 
 @runs_app.command("show")
 def runs_show(ctx: typer.Context, run_id: str) -> None:
     state = _state(ctx)
+    run_dir = _run_dir(state.cfg.workspace, run_id)
     runs = load_runs(state.cfg.workspace)
     if run_id not in runs:
         raise RagentError(f"run not found: {run_id}")
+    metadata = run_dir / "run.json"
+    if metadata.is_file():
+        console.print_json(metadata.read_text(encoding="utf-8"))
     console.print_json(json.dumps(runs[run_id], ensure_ascii=False))
-    report = state.cfg.workspace / "runs" / run_id / "report.md"
-    if report.exists():
-        console.print(f"report: {report}")
+    report_path = run_dir / "report.md"
+    if report_path.exists():
+        console.print(f"report: {report_path}")
+    verification = run_dir / "verification.json"
+    if verification.exists():
+        console.print(f"verification: {verification}")
+
+
+@runs_app.command("verify")
+def runs_verify(ctx: typer.Context, run_id: str) -> None:
+    result = verify_run(_run_dir(_state(ctx).cfg.workspace, run_id))
+    console.print_json(json.dumps(result, ensure_ascii=False))
+    if not result["passed"]:
+        raise typer.Exit(1)
 
 
 @runs_app.command("export")
@@ -323,7 +460,9 @@ def refine_merge(
     all_ops: Annotated[bool, typer.Option("--all")] = False,
 ) -> None:
     selected = ["all"] if all_ops else (accept or [])
-    console.print(f"merged graph: {merge(load_proposal(proposal_path), selected, _state(ctx).cfg)}")
+    console.print(
+        f"merged graph: {merge(load_proposal(proposal_path), selected, _state(ctx).cfg)}"
+    )
 
 
 @refine_app.command("rollback")
