@@ -1,24 +1,29 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from uuid import uuid4
 
 from ragent.config import Config
-from ragent.errors import GraphError, MetricError
-from ragent.graph_builder.schema import Edge, Graph, Node
+from ragent.errors import BudgetError, GraphError, MetricError, VerificationError
+from ragent.graph_builder.schema import Edge, Graph, Metric, Node
 from ragent.llm import get_llm
 from ragent.llm.base import LLM, Message
 from ragent.llm.usage import get_ledger
+from ragent.tools import obsidian_mcp, report_generator
 from ragent.tools.registry import ToolSpec, bind
 from ragent.trajectories.log import TraceLog
 
 from .context import RunContext
-from .metrics import MetricResult, check
+from .metrics import check
+from .preflight import preflight
+from .verification import verify_outputs, verify_run
 
 
 @dataclass(slots=True)
@@ -29,28 +34,94 @@ class RunResult:
     artifacts: dict[str, str]
     citations: list[dict[str, str]]
     steps: int
+    verification: dict[str, Any] | None = None
 
     @property
     def report_path(self) -> str | None:
         return self.artifacts.get("report_path")
 
+    @property
+    def obsidian_index_path(self) -> str | None:
+        return self.artifacts.get("obsidian_index_path")
+
+
+def prepare_graph(
+    graph: Graph,
+    cfg: Config,
+    *,
+    report: bool,
+    obsidian: bool,
+) -> Graph:
+    prepared = graph.model_copy(deep=True)
+    for edge in prepared.edges:
+        if not obsidian or cfg.obsidian.layout == "bundle":
+            edge.tool_set = [name for name in edge.tool_set if name != "obsidian.note"]
+        if not report and "report.generate" in edge.tool_set:
+            edge.tool_set = [
+                name for name in edge.tool_set if name != "report.generate"
+            ]
+            edge.produces = "publication"
+            edge.termination_metric = Metric(kind="artifact_exists", key="quick_test")
+        if (
+            edge.termination_metric.kind == "has_citations"
+            and edge.termination_metric.key == "prior_work"
+        ):
+            edge.termination_metric.n = max(
+                edge.termination_metric.n or 0, cfg.research.min_sources
+            )
+    return prepared
+
 
 def _render(edge: Edge, node: Node, ctx: RunContext) -> str:
-    artifacts = json.dumps(ctx.artifacts, ensure_ascii=False, indent=2)
+    source_index = json.dumps(
+        {"sources": ctx.citations, "aliases": ctx.source_aliases},
+        ensure_ascii=False,
+        indent=2,
+    )
     values = {
         "query": ctx.query,
-        "node": json.dumps({"id": node.id, "title": node.title, "description": node.description}),
-        "artifacts": artifacts,
+        "node": json.dumps(
+            {"id": node.id, "title": node.title, "description": node.description}
+        ),
+        "artifacts": json.dumps(ctx.artifacts, ensure_ascii=False, indent=2),
         "last_failure": ctx.last_failure or "none",
+        "skill": ctx.skill_text or "No explicit research skill was configured.",
+        "instructions": ctx.cfg.research.instructions or "No additional instructions.",
+        "sources": source_index,
     }
     prompt = edge.prompt_template
     for key, value in values.items():
         prompt = prompt.replace("{" + key + "}", value)
-    return prompt
+    return (
+        prompt
+        + "\n\nResearch procedure:\n"
+        + values["skill"]
+        + "\n\nConfigured instructions:\n"
+        + values["instructions"]
+        + "\n\nCanonical fetched-source index:\n"
+        + source_index
+    )
 
 
 def _safe_artifact_key(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value) or "output"
+
+
+def _verified_tool_path(ctx: RunContext, value: str) -> str | None:
+    try:
+        path = Path(value).expanduser().resolve(strict=True)
+        roots = [ctx.run_dir.resolve(strict=True)]
+        if ctx.cfg.obsidian.vault_path is not None:
+            roots.append(ctx.cfg.obsidian.vault_path.expanduser().resolve(strict=True))
+        if (
+            path.is_file()
+            and path.stat().st_size > 0
+            and any(path.is_relative_to(root) for root in roots)
+        ):
+            return str(path)
+    except OSError:
+        pass
+    return None
 
 
 def _tool_loop(
@@ -87,20 +158,35 @@ def _tool_loop(
                 called.append(spec.name)
                 try:
                     result = spec.fn(**call.arguments)
+                except BudgetError:
+                    raise
                 except Exception as exc:
                     result = {"error": f"{type(exc).__name__}: {exc}"}
             if isinstance(result, dict):
                 for key, value in result.items():
                     if key.endswith("_path") and isinstance(value, str) and value:
-                        produced[key] = value
-                        ctx.artifacts[key] = value
-            results.append({"tool": spec.name if spec else call.name, "call_id": call.id, "result": result})
+                        verified = _verified_tool_path(ctx, value)
+                        if verified is not None:
+                            produced[key] = verified
+                            ctx.artifacts[key] = verified
+            results.append(
+                {
+                    "tool": spec.name if spec else call.name,
+                    "call_id": call.id,
+                    "result": result,
+                }
+            )
         messages.extend(
             [
-                Message("assistant", completion.text or "I will use the returned tool evidence."),
+                Message(
+                    "assistant",
+                    completion.text or "I will use the returned tool evidence.",
+                ),
                 Message(
                     "user",
-                    "Tool results:\n" + json.dumps(results, ensure_ascii=False) + "\nContinue the stage.",
+                    "Tool results:\n"
+                    + json.dumps(results, ensure_ascii=False)
+                    + "\nContinue the stage.",
                 ),
             ]
         )
@@ -119,11 +205,14 @@ def _tool_loop(
 def _make_context(
     query: str,
     cfg: Config,
+    skill_text: str,
     on_event: Callable[[dict[str, Any]], None] | None,
 ) -> RunContext:
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
+    run_id = (
+        datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
+    )
     run_dir = cfg.workspace / "runs" / run_id
-    (run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+    (run_dir / "artifacts").mkdir(parents=True, exist_ok=False)
     trace = TraceLog(run_dir, run_id, on_event)
     return RunContext(
         run_id=run_id,
@@ -133,7 +222,76 @@ def _make_context(
         citations=[],
         cfg=cfg,
         trace=trace,
+        skill_text=skill_text,
+        source_aliases={},
     )
+
+
+def _write_metadata(ctx: RunContext, metadata: dict[str, Any]) -> None:
+    (ctx.run_dir / "run.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _metadata(
+    ctx: RunContext,
+    graph: Graph,
+    admission: dict[str, Any],
+    ledger_before: dict[str, Any],
+    *,
+    report: bool,
+    obsidian: bool,
+) -> dict[str, Any]:
+    graph_text = graph.model_dump_json(indent=2)
+    graph_path = ctx.run_dir / "graph.json"
+    graph_path.write_text(graph_text, encoding="utf-8")
+    skill: dict[str, str] | None = None
+    if ctx.skill_text:
+        skill_path = ctx.run_dir / "skill.md"
+        skill_path.write_text(ctx.skill_text, encoding="utf-8")
+        skill = {
+            "path": "skill.md",
+            "sha256": hashlib.sha256(ctx.skill_text.encode()).hexdigest(),
+        }
+    obsidian_info = admission.get("obsidian")
+    return {
+        "version": 1,
+        "run_id": ctx.run_id,
+        "query": ctx.query,
+        "status": "running",
+        "final_node": None,
+        "requirements": {
+            "min_sources": ctx.cfg.research.min_sources,
+            "report": report,
+            "obsidian_bundle": bool(obsidian and ctx.cfg.obsidian.layout == "bundle"),
+        },
+        "models": admission.get("models", {}),
+        "graph": {
+            "path": "graph.json",
+            "sha256": hashlib.sha256(graph_text.encode()).hexdigest(),
+        },
+        "skill": skill,
+        "pricing": admission.get("pricing", {}),
+        "budget": {
+            "strict": ctx.cfg.budget.strict,
+            "limit_usd": ctx.cfg.budget.cost_limit_usd,
+            "ledger_path": str((ctx.cfg.workspace / "usage.json").resolve()),
+            "before": ledger_before,
+            "after": None,
+        },
+        "obsidian": obsidian_info,
+        "outputs": {
+            "report_path": None,
+            "obsidian_manifest_path": None,
+            "obsidian_index_path": None,
+        },
+    }
+
+
+def _update_outputs(metadata: dict[str, Any], ctx: RunContext) -> None:
+    outputs = metadata["outputs"]
+    for key in ("report_path", "obsidian_manifest_path", "obsidian_index_path"):
+        outputs[key] = ctx.artifacts.get(key)
 
 
 def run(
@@ -142,16 +300,56 @@ def run(
     cfg: Config,
     *,
     start: str | None = None,
-    max_steps: int = 24,
+    max_steps: int | None = None,
+    report: bool | None = None,
+    obsidian: bool | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> RunResult:
-    ctx = _make_context(query, cfg, on_event)
-    ledger = get_ledger(cfg)
-    node = graph.node(start or graph.entry)
+    resolved_query = query.strip()
+    if not resolved_query:
+        raise GraphError("research query must not be blank")
+    resolved_steps = max_steps if max_steps is not None else cfg.research.max_steps
+    resolved_report = report if report is not None else cfg.research.report
+    resolved_obsidian = obsidian if obsidian is not None else cfg.research.obsidian
+    effective_cfg = cfg.model_copy(deep=True)
+    effective_cfg.research.report = resolved_report
+    effective_cfg.research.obsidian = resolved_obsidian
+    prepared = prepare_graph(
+        graph,
+        effective_cfg,
+        report=resolved_report,
+        obsidian=resolved_obsidian,
+    )
+    admission = preflight(prepared, effective_cfg)
+    skill_text = ""
+    if effective_cfg.research.skill_path is not None:
+        skill_text = (
+            effective_cfg.research.skill_path.expanduser()
+            .resolve(strict=True)
+            .read_text(encoding="utf-8")
+        )
+    ctx = _make_context(resolved_query, effective_cfg, skill_text, on_event)
+    ledger = get_ledger(effective_cfg)
+    before_campaign = ledger.snapshot()
+    metadata = _metadata(
+        ctx,
+        prepared,
+        admission,
+        before_campaign,
+        report=resolved_report,
+        obsidian=resolved_obsidian,
+    )
+    _write_metadata(ctx, metadata)
+    node = prepared.node(start or prepared.entry)
     steps = 0
+
+    def usage_subscriber(event: dict[str, Any]) -> None:
+        ctx.trace.append(event)
+
+    ledger.subscribe(usage_subscriber)
     try:
-        while not node.terminal and steps < max_steps:
-            outward = graph.out_edges(node.id)
+        while not node.terminal and steps < resolved_steps:
+            outward = prepared.out_edges(node.id)
             if not outward:
                 raise GraphError(f"non-terminal node has no outward edges: {node.id}")
             eligible: list[Edge] = []
@@ -160,7 +358,7 @@ def run(
                 if edge.precondition is None:
                     eligible.append(edge)
                     continue
-                result = check(edge.precondition, ctx, cfg)
+                result = check(edge.precondition, ctx, effective_cfg)
                 if result.passed:
                     eligible.append(edge)
                 else:
@@ -171,7 +369,7 @@ def run(
                     + "; ".join(failed_preconditions)
                 )
             edge = eligible[0]
-            llm = get_llm("executor", node.model, cfg)
+            llm = get_llm("executor", node.model, effective_cfg)
             before = ledger.snapshot()["session"]
             text, tool_calls, tool_artifacts = _tool_loop(
                 llm,
@@ -179,12 +377,35 @@ def run(
                 bind(edge.tool_set, ctx),
                 ctx,
             )
-            after = ledger.snapshot()["session"]
-            artifact = tool_artifacts.get(edge.produces, text)
+            if edge.produces.endswith("_path"):
+                artifact = tool_artifacts.get(edge.produces, "")
+            else:
+                artifact = text
             ctx.artifacts[edge.produces] = artifact
-            artifact_path = ctx.run_dir / "artifacts" / f"{_safe_artifact_key(edge.produces)}.md"
-            artifact_path.write_text(artifact, encoding="utf-8")
-            metric = check(edge.termination_metric, ctx, cfg)
+            if not edge.produces.endswith("_path"):
+                artifact_path = (
+                    ctx.run_dir
+                    / "artifacts"
+                    / f"{_safe_artifact_key(edge.produces)}.md"
+                )
+                artifact_path.write_text(artifact, encoding="utf-8")
+            terminal_target = prepared.node(edge.target).terminal
+            if terminal_target:
+                if resolved_report:
+                    ctx.artifacts["report_path"] = report_generator.generate(ctx)
+                if resolved_obsidian and effective_cfg.obsidian.layout == "bundle":
+                    ctx.artifacts["obsidian_manifest_path"] = (
+                        obsidian_mcp.export_bundle(ctx)
+                    )
+                _update_outputs(metadata, ctx)
+                metadata["budget"]["after"] = ledger.snapshot()
+                metadata["final_node"] = edge.target
+                _write_metadata(ctx, metadata)
+                output_result = verify_outputs(ctx.run_dir)
+                if not output_result["passed"]:
+                    raise VerificationError("; ".join(output_result["errors"]))
+            metric = check(edge.termination_metric, ctx, effective_cfg)
+            after = ledger.snapshot()["session"]
             attempt = ctx.attempts[edge.id] + 1
             ctx.trace.transition(
                 node_id=node.id,
@@ -206,7 +427,7 @@ def run(
             steps += 1
             if metric.passed:
                 ctx.last_failure = ""
-                node = graph.node(edge.target)
+                node = prepared.node(edge.target)
                 continue
             ctx.attempts[edge.id] += 1
             ctx.last_failure = metric.detail
@@ -216,12 +437,44 @@ def run(
                     f"edge {edge.id} failed {failures} times: {metric.detail}"
                 )
             if failures >= edge.max_attempts and edge.on_fail:
-                node = graph.node(edge.on_fail)
+                node = prepared.node(edge.on_fail)
         if not node.terminal:
-            raise MetricError(f"maximum step count {max_steps} reached at node {node.id}")
+            raise MetricError(
+                f"maximum step count {resolved_steps} reached at node {node.id}"
+            )
+        metadata["status"] = "completed"
+        metadata["final_node"] = node.id
+        metadata["budget"]["after"] = ledger.snapshot()
+        _update_outputs(metadata, ctx)
+        ctx.trace.append(
+            {
+                "event": "complete",
+                "final_node": node.id,
+                "report_path": ctx.artifacts.get("report_path"),
+                "obsidian_index_path": ctx.artifacts.get("obsidian_index_path"),
+            }
+        )
+        _write_metadata(ctx, metadata)
+        verification = verify_run(ctx.run_dir)
+        if not verification["passed"]:
+            metadata["status"] = "failed"
+            _write_metadata(ctx, metadata)
+            ctx.trace.error(
+                node_id=node.id,
+                detail="final verification failed: "
+                + "; ".join(verification["errors"]),
+            )
+            raise VerificationError("; ".join(verification["errors"]))
     except Exception as exc:
+        metadata["status"] = "failed"
+        metadata["final_node"] = node.id
+        metadata["budget"]["after"] = ledger.snapshot()
+        _update_outputs(metadata, ctx)
+        _write_metadata(ctx, metadata)
         ctx.trace.error(node_id=node.id, detail=str(exc))
         raise
+    finally:
+        ledger.unsubscribe(usage_subscriber)
     return RunResult(
         run_id=ctx.run_id,
         reached_done=node.terminal,
@@ -229,4 +482,5 @@ def run(
         artifacts=dict(ctx.artifacts),
         citations=list(ctx.citations),
         steps=steps,
+        verification=verification,
     )
