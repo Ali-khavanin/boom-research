@@ -98,10 +98,16 @@ Everything `ragent` writes lives under the configured `workspace` (default `.rag
   graph.rejected.json                      # last build that failed audit (only written on failure)
   usage.json                               # lifetime + by-model token/cost ledger (budget.persist)
   graph_versions/<timestamp>/graph.json    # pre-merge graph snapshot, one per `refine merge` call
-  runs/<run_id>/trace.jsonl                # append-only trajectory for one research run
-  runs/<run_id>/artifacts/*.md             # per-stage artifacts written that run
-  runs/<run_id>/report.md                  # final report, when report.generate ran
-  refine/<timestamp>/proposal.json         # `refine propose` output
+  runs/<run_id>/run.json                   # query, status, contract, models, budget, output paths
+  runs/<run_id>/graph.json                 # exact effective graph used by the run
+  runs/<run_id>/skill.md                   # exact explicit skill, when configured
+  runs/<run_id>/trace.jsonl                # append-only transitions, usage, search, completion/errors
+  runs/<run_id>/sources.json               # canonical fetched-source provenance and redirect aliases
+  runs/<run_id>/sources/*.md               # immutable fetched evidence snapshots
+  runs/<run_id>/artifacts/*.md             # per-stage artifacts
+  runs/<run_id>/report.md                   # validated final report
+  runs/<run_id>/verification.json           # latest offline verification result
+  refine/<timestamp>/proposal.json          # `refine propose` output
   refine/<timestamp>/rollback.json         # `refine rollback` (gated acceptance) output
 ```
 
@@ -118,9 +124,9 @@ Everything `ragent` writes lives under the configured `workspace` (default `.rag
 Global CLI flags: `--config PATH`, `--workspace PATH`, repeatable `--model role=provider/model`.
 
 Seven roles are required — `book_to_skill`, `graph_builder`, `executor`, `report`, `obsidian`,
-`refiner`, `judge` — each with its own `provider`/`model`/`temperature`/`max_tokens`. A config
-missing any role fails with `missing role configuration: <roles>`; a role naming a provider not
-under `[providers.*]` fails with `roles reference unknown providers: <names>`.
+`refiner`, and `judge`. Each role has `provider`, `model`, `temperature`, `max_tokens`, and optional
+`reasoning_max_tokens`; an explicit reasoning cap must be positive and smaller than `max_tokens`.
+Missing roles and unknown providers are configuration errors.
 
 **Built-in defaults** (used for any role/field not set in `ragent.toml`): every role routes to
 `openrouter` / `anthropic/claude-sonnet-4.5`, `temperature = 0.2`, `max_tokens = 8192`.
@@ -160,26 +166,45 @@ temperature = 0.0
 Other config sections:
 
 ```toml
+[research]
+query = "Optional reusable query"
+graph_path = ".ragent/graph.json"
+skill_path = ".ragent/skills/SKILL.md"
+instructions = "Review-specific requirements"
+min_sources = 6
+max_steps = 24
+report = true
+obsidian = true
+
 [search]
 backend = "ddg"                 # or "tavily"
 api_key_env = "TAVILY_API_KEY"
 max_results = 6
 
 [obsidian]
-backend = "vault"               # or "mcp"
+backend = "vault"               # bundle requires vault, not MCP
+vault_path = "/path/to/existing/vault"
 folder = "Research"
-mcp_command = []                # for MCP: ["node", "/path/to/server.js"]
+layout = "bundle"                # "note" or deterministic "bundle"
+tags = ["research"]
+related_notes = ["Existing/Note"]
+mcp_command = []                 # single-note MCP only
 
 [budget]
-token_limit = 400000            # omit for unlimited
-cost_limit_usd = 5.00           # omit for unlimited
-warn_fraction = 0.8             # status line turns red at/above this fraction of a limit
-persist = true                  # write usage.json; "session" totals are never persisted
+strict = true
+cost_limit_usd = 3.50
+warn_fraction = 0.8
+persist = true                  # required by strict mode
 
-[prices."openai/gpt-5-mini"]    # only needed for non-OpenRouter providers, or unpriced OpenRouter labels
+[prices."openai/gpt-5-mini"]    # ordinary mode only when provider cost is absent
 input_per_mtok = 0.25
 output_per_mtok = 2.00
 ```
+
+Strict mode requires every effective role and node override to use OpenRouter. Bundle export requires
+`research.report = true`, `obsidian.backend = "vault"`, and an existing vault containing
+`.obsidian`. `ragent.e2e.toml` is the checked-in, non-secret profile for the process-aware research
+scenario; it never contains an API key.
 
 Environment overlay variables: `RAGENT_WORKSPACE`, `RAGENT_SEARCH_BACKEND`,
 `RAGENT_OBSIDIAN_VAULT_PATH`, `RAGENT_OBSIDIAN_FOLDER`, `RAGENT_MODEL_<ROLE>` (must be
@@ -201,17 +226,19 @@ ragent --model executor=openai/gpt-5-mini research "query"
 | `ragent graph build` | `--skill-dir PATH`, `--out PATH`, `--no-extend` | Merges `skills/chapters/*.md` onto the seed graph; `--no-extend` returns the unmodified 8-node seed with no LLM calls. Writes `graph.json` + `graph.mmd`, or `graph.rejected.json` on audit failure. Exits 1 if the final audit fails. |
 | `ragent graph show` | `--node TEXT`, `--graph PATH` | Prints a tree of one node (or all nodes) with its outward edges and their metrics. |
 | `ragent graph audit` | `--graph PATH` | Re-runs the soundness audit on a saved graph; exits 1 on failure. |
-| `ragent research QUERY` | `--graph PATH`, `--start TEXT`, `--max-steps N=24 (min 1)`, `--report/--no-report`, `--obsidian/--no-obsidian` | Executes the graph for one query. `--no-obsidian` strips `obsidian.note` from every edge's tool set. `--no-report` strips `report.generate` from every edge that has it, sets that edge's `produces = "publication"`, and swaps its metric to `artifact_exists` on `quick_test`. |
-| `ragent runs list` | — | Table of run id, transition count, final target, newest first. |
-| `ragent runs show RUN_ID` | — | Prints the raw JSONL trace as JSON, plus the report path if one was written. |
-| `ragent runs export CSV_PATH` | — | Writes `case_id,activity,timestamp,step,edge_id,metric_passed` for process-mining tools. |
+| `ragent research [QUERY]` | `--graph PATH`, `--start TEXT`, `--max-steps N`, `--report/--no-report`, `--obsidian/--no-obsidian`, `--preflight` | Resolves omitted values from `[research]`. `--preflight` performs graph/route/skill/credential/model/price/budget/vault checks without creating a run, invoking inference, or writing notes. |
+| `ragent runs list` | — | Table of run id, transition count, and explicit persisted state for new runs. |
+| `ragent runs show RUN_ID` | — | Prints saved `run.json`, the raw trace, and output/verification paths. Run IDs are containment-checked. |
+| `ragent runs verify RUN_ID` | — | Offline verification of recorded provenance, stages, fetched source hashes, report citations, bundle notes/links/hashes, model identity, strict exposure, and completion evidence. Exit 0 means every recorded requirement passed. |
+| `ragent runs export CSV_PATH` | — | Writes transition-only `case_id,activity,timestamp,step,edge_id,metric_passed` rows. |
 | `ragent refine propose` | — | Sends aggregated trajectory stats (not the graph, artifacts, or query text) to the `refiner` role; writes `refine/<ts>/proposal.json`. |
 | `ragent refine merge PROPOSAL` | `--accept ID` (repeatable), `--all` | Applies selected proposal operations, snapshotting the current graph first; rejects if the merged graph fails audit. |
 | `ragent refine rollback CANDIDATE` | — | Runs the gated-acceptance comparison (baseline vs. candidate graph over three fixed eval queries) and rolls back the candidate if it doesn't clear the acceptance thresholds. |
 | `ragent tui` | — | Launches the interactive three-pane UI. |
 
-Exit codes: expected failures (`RagentError` subclasses — `GraphError`, `MetricError`,
-`ProviderError`, `BudgetError`) print `error: <message>` and return 1 from `entrypoint()`.
+Exit codes: expected failures (`RagentError` subclasses, including `GraphError`, `MetricError`,
+`ProviderError`, `BudgetError`, `PreflightError`, `ExportError`, and `VerificationError`) print
+`error: <message>` and return 1 from `entrypoint()`.
 `providers check` and a failing graph build/audit exit 1 via a separate `typer.Exit(1)`. Malformed
 CLI arguments or an invalid `--model` value are Typer usage errors, exit code 2.
 
@@ -272,12 +299,14 @@ submits.
   `graph.json` (or `graph.rejected.json` if the audit fails), always writes `graph.mmd`, and shows
   the Mermaid source in the artifact pane. The path is split on whitespace (`raw.split()`), so paths
   containing spaces are not supported.
-- `/budget` — prints the status line and a per-model breakdown; also shows the `#breakdown` table.
-- `/budget tokens N` — sets the session token limit (in memory only).
-- `/budget cost USD` — sets the session cost limit (in memory only).
-- `/budget price provider/model IN OUT` — sets a manual per-mtok price for a label.
-- `/budget reset` — resets session totals only (lifetime totals in `usage.json` are untouched).
-- `/budget off` — clears both limits.
+- `/budget` — prints actual session/campaign spend, outstanding reserved exposure, remaining strict
+  allowance, and per-model totals.
+- `/budget tokens N` — sets the ordinary session token limit.
+- `/budget cost USD` — changes an ordinary cost limit. In strict mode only a lower limit above current
+  exposure is accepted; increases are refused.
+- `/budget price provider/model IN OUT` — sets a manual ordinary-mode per-mtok price.
+- `/budget reset` — resets display/session totals only; persisted strict campaign exposure is unchanged.
+- `/budget off` — clears ordinary limits and is refused in strict mode.
 - Any other `/…` prints the two help lines: the budget usage summary and `/book <pdf-path>`.
 
 `/budget` and `#model_override` edits never write `ragent.toml` — they only mutate the in-memory
@@ -289,23 +318,35 @@ otherwise use `/book <pdf>` and Enter.
 
 ## Budgets and cost control
 
-One `UsageLedger` per resolved workspace path is shared by every `get_llm` call across the CLI and
-TUI in a process. Every LLM call runs `precheck()` against **session** totals before the request and
-`record()` only after a successful response — so a budget only stops the *next* call, not a
-mid-flight one. `usage.json` persists lifetime and by-model totals (when `budget.persist = true`,
-the default); the `session` counter itself is never persisted and resets every process.
+Ordinary mode retains session `precheck()` then post-response `record()` behavior. Strict mode uses a
+version-2 persistent campaign ledger instead:
 
-Only `openrouter` reports real USD cost per call (`usage.include` in the request payload). Any other
-provider's spend shows as `... calls unpriced (set /budget price)` and does not count toward
-`cost_limit_usd` unless you add a `[prices."<provider>/<model>"]` entry.
+1. authenticated preflight validates exact OpenRouter model pricing/capabilities and eligible
+   endpoints;
+2. each `LLM.complete` atomically reserves the conservative maximum cost under a sidecar `flock`
+   before its single HTTP POST;
+3. a successful response must report finite nonnegative cost and meaningful token usage within the
+   validated bounds; settlement replaces the reservation with actual usage in one atomic write;
+4. any timeout, malformed response, missing usage, interruption, or accounting failure leaves the
+   reservation outstanding and blocks further paid calls.
 
-Demonstrated behavior: `RAGENT_BUDGET_COST_USD=0.000001 ragent book ./paper.pdf --force` completes
-one chapter (the call that pushes session cost past the tiny limit still completes and is recorded),
-then the next LLM call's `precheck()` blocks with `error: cost budget reached: ...` and the process
-exits 1.
+Admission requires `lifetime actual + outstanding reservations + new reservation <=
+strict_cost_limit_usd`. The campaign ceiling is persisted and cannot be raised or bypassed by a new
+process, `/budget reset`, `/budget off`, a malformed ledger, or a failed write. Strict OpenRouter
+requests disable transport/schema retries and constrain provider routing, parameters, and maximum
+prices to the preflight snapshot.
 
-See [algorithm.md](docs/algorithm.md) for the exact `BudgetError` message templates and
-`status_line()` format.
+`ragent.e2e.toml` sets a `$3.50` strict ceiling for the process-aware scenario. Run the free checks
+before inference:
+
+```bash
+ragent --config ragent.e2e.toml graph audit --graph .ragent/graph.json
+ragent --config ragent.e2e.toml research --preflight
+```
+
+This proves admission and configuration only. The completed run plus `runs verify` proves the
+specific end-to-end scenario exercised; it is not a claim that every optional graph branch or every
+application feature was tested.
 
 ## Further reading
 

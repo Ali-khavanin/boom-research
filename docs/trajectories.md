@@ -2,7 +2,9 @@
 
 ## Definition
 
-A trajectory is the append-only event log of one call to `run()` (`src/ragent/executor/runner.py`): the file `<workspace>/runs/<run_id>/trace.jsonl`, one JSON object per line. There is no `Trajectory` class anywhere in the codebase. On read, a trajectory is just a `list[dict]` — the loader function is `load_runs` in `src/ragent/trajectories/store.py`.
+A trajectory is the append-only event log of one admitted call to `run()`: the file
+`<workspace>/runs/<run_id>/trace.jsonl`, one JSON object per line. New runs pair it with authoritative
+`run.json` metadata and offline `verification.json`; transition-only CSV compatibility is preserved.
 
 `run_id` is constructed in `_make_context` (`executor/runner.py`) as:
 
@@ -12,28 +14,22 @@ run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().h
 
 i.e. a UTC timestamp such as `20260916T120000Z` followed by `-` and the first 8 hex characters of a random UUID4, e.g. `20260916T120000Z-3f9a1c2d`.
 
-Nothing on the read path validates this shape. `load_runs` simply globs `runs/*/trace.jsonl`; any child directory of `runs/` that happens to contain a `trace.jsonl` file is treated as a run, keyed by that directory's name (`trace_path.parent.name`). A hand-created directory with an arbitrary name and a hand-written `trace.jsonl` would show up in `ragent runs list` exactly like a real run.
+CLI inspection rejects run IDs containing path traversal. Provider/graph/skill/vault preflight occurs
+before `_make_context`, so admission failure creates no run directory. Once admitted,
+`runs/<run_id>/artifacts/` is created and version-1 `run.json` is written immediately with:
 
-Directory creation order, from `_make_context`:
+`version`, `run_id`, `query`, `status`, `final_node`, `requirements`, `models`, `graph`, `skill`,
+`pricing`, `budget`, `obsidian`, and `outputs`.
 
-```python
-run_dir = cfg.workspace / "runs" / run_id
-(run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
-trace = TraceLog(run_dir, run_id, on_event)
-```
+`status` is `running`, `completed`, or `failed`. The effective graph is copied to `graph.json`; an
+explicit skill is copied verbatim to `skill.md`; both metadata entries record relative path and
+SHA-256. Requirements record minimum sources and required report/bundle outputs. Budget metadata
+records strict mode, campaign limit, absolute ledger path, and before/after snapshots. Output keys are
+`report_path`, `obsidian_manifest_path`, and `obsidian_index_path`, using null until produced.
 
-`runs/<run_id>/artifacts/` is created immediately when the run starts, before the graph loop executes a single stage. `TraceLog.__init__` (`src/ragent/trajectories/log.py`) also `mkdir`s `run_dir` (a no-op at that point, since `artifacts/` already implied it) but does **not** create `trace.jsonl` itself — the file materializes lazily on the first `TraceLog.append()` call, i.e. the first stage transition or, if the run raises before completing a single stage (for example a `GraphError` for a non-terminal node with no outward edges), the first error record. If a run crashes before any transition or error is logged, `runs/<run_id>/artifacts/` can exist with no `trace.jsonl` next to it.
-
-Writes are append-per-record and unbuffered across calls: `TraceLog.append` does
-
-```python
-with self.path.open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-```
-
-opening and closing the file handle on every single record (no explicit `fsync`), so each record is durably flushed to disk independently of whether the run later fails.
-
-The research query string itself is never written into the trace. `RunContext.query` (`src/ragent/executor/context.py`) holds it in memory for prompt rendering, but neither `TraceLog.transition` nor `TraceLog.error` (nor the base `append`, which only injects `case_id`/`timestamp`/`step`) accepts or stores a query field. A trace file alone cannot tell you what question the run was answering.
+Unlike historical traces, `run.json` records the research query and resolved execution contract.
+Historical directories without `run.json` remain readable as traces but `runs verify` reports that
+provenance is unavailable rather than synthesizing it.
 
 ## Record shape
 
@@ -76,16 +72,22 @@ which `append`s a dict with exactly these keys beyond the common three: `activit
 
 - **`target` is written unconditionally, on every attempt, whether the metric passed or failed.** The runner computes `edge.target` and passes it into `transition` before it knows or branches on `metric.passed` — a failed attempt whose control flow actually stays on the same edge (retry) or jumps to `edge.on_fail` still logs `target: edge.target`, the edge's *nominal* destination, not the node the run actually continues from. Reading `target` off a failed-metric record does not tell you where the run went next; only a *passing* record's `target` is where `node` is reassigned to next.
 - `attempt` is prior failures plus one: the runner computes `attempt = ctx.attempts[edge.id] + 1` (`ctx.attempts` is a `Counter[str]` on `RunContext`, incremented only after a failure) before logging, then increments `ctx.attempts[edge.id]` afterward only if the metric failed. So the first try of an edge logs `attempt: 1`, and `ctx.attempts` accumulates across every revisit of that edge id within the run.
-- `tokens` and `cost_usd` are **session ledger deltas for that single attempt**, not run totals or lifetime totals: the runner snapshots `ledger.snapshot()["session"]` immediately before and after the tool loop (`before`/`after`) and logs `after["total_tokens"] - before["total_tokens"]` and `round(after["cost_usd"] - before["cost_usd"], 6)`. Summing a run's `tokens`/`cost_usd` fields reconstructs that run's total spend; it does not include usage from other concurrent or prior runs sharing the same ledger.
-- There is no dedicated "run completed" record type. Completion is inferred structurally: a run reached `done` if some transition record has `target == "done"` and `metric.passed == true` (this is exactly the rule `trajectories/store.py`'s `stats` function uses — see below). `RunResult.reached_done` (returned in-process, not logged) is simply `node.terminal` after the loop exits normally.
+- `tokens` and `cost_usd` are session-ledger deltas covering the entire attempt, including judge
+  usage because the post-attempt snapshot is taken after metric evaluation.
 
-**Error records** come from `TraceLog.error`, called from the `except Exception as exc` handler wrapping the whole graph loop in `run()`:
+**Usage records** are sanitized ledger events subscribed during the run. They identify role/model,
+request tokens/cost, session/lifetime totals, and strict reservation/exposure fields. They have no
+`edge_id`, so CSV export continues to exclude them.
 
-```python
-ctx.trace.error(node_id=node.id, detail=str(exc))
-```
+**Search records** use `event=\"search\"` and record query, backend, result count, and returned URLs.
 
-which appends `{"activity": node_id, "event": "error", "detail": str(exc)}` on top of the common `case_id`/`timestamp`/`step` fields, then re-raises. An error record has no `edge_id`, `target`, or `metric` key at all — it marks the node the run was on when it aborted (due to `GraphError`, `MetricError`, or any other uncaught exception) and carries the exception's string message as `detail`.
+**Completion records** use `event=\"complete\"` and are appended only after required output checks,
+with final report/index paths. `run.json` is then persisted as completed and `verify_run` checks both
+the passed terminal transition and this completion record.
+
+**Error records** use `event=\"error\"`, source node in `activity`, and `detail`. Failures update
+`run.json` to `failed`; a late error therefore overrides an earlier nominal terminal target for new
+run summaries.
 
 ### Process-mining framing
 
@@ -122,9 +124,16 @@ CSV_FIELDS = ("case_id", "activity", "timestamp", "step", "edge_id", "metric_pas
 
 CLI surface (`src/ragent/cli/main.py`, `runs_app`):
 
-- `ragent runs list` — calls `load_runs`, and for each run prints a table row `Run | Transitions | Final target`, where `Transitions` counts events with an `edge_id` and `Final target` is the `target` field of the *last* such transition event (which, per the caveat above, is `edge.target` from the last attempt regardless of whether that attempt's metric passed).
-- `ragent runs show RUN_ID` — calls `load_runs`, raises `RagentError(f"run not found: {run_id}")` if the id is absent, otherwise prints the full raw event list for that run as JSON, and additionally prints `report: <path>` if `runs/<run_id>/report.md` exists on disk.
-- `ragent runs export CSV_PATH` — calls `to_csv(workspace, csv_path)` and prints `exported: <path>`.
+- `ragent runs list` prefers explicit `run.json.status` for new runs and falls back to the historical
+  last-transition target only when metadata is absent.
+- `ragent runs show RUN_ID` containment-checks the ID and prints `run.json`, trace events, and output
+  paths.
+- `ragent runs verify RUN_ID` is offline. It rechecks the saved graph/skill/evidence hashes, six
+  required stages, fetched-and-cited source threshold, report references, bundle frontmatter/tags,
+  every wikilink and note hash, related-note hashes, effective model labels, strict campaign exposure
+  with zero reservations, completed state, passed terminal transition, and completion record. It
+  writes `verification.json` and exits nonzero on named failures.
+- `ragent runs export CSV_PATH` retains transition-only CSV output.
 
 ## Aggregation
 
@@ -135,7 +144,9 @@ CLI surface (`src/ragent/cli/main.py`, `runs_app`):
 ```
 
 - **`edges`** — `dict[edge_id, {"attempts": int, "pass_rate": float, "mean_artifact_size": float}]`, one entry per edge id that appears in at least one transition event across all runs, sorted by edge id. `attempts` is `len(events)` for that edge — a raw **count of transition events** referencing that edge id (across every run and every retry), not a distinct-run count and not a max of any `attempt` field. `pass_rate` is `passed / len(events)` where `passed` sums `bool(event["metric"]["passed"])` over those same events, i.e. passing-event fraction, not a per-run success rate. `mean_artifact_size` is `statistics.mean` of each event's `artifact_chars` (defaulting a missing key to `0` via `event.get("artifact_chars", 0)`), so it is in characters, matching the trace field's own unit.
-- **`incomplete_runs`** — list of run ids for which no event in that run had both `target == "done"` and `metric["passed"] == True`. This is the same completion rule described in Record shape above, applied per run.
+- **`incomplete_runs`** — new runs are complete only when `run.json.status == "completed"`; this
+  prevents a late error from being hidden by an earlier passed nominal `done` transition. Historical
+  runs without metadata retain the old passed-terminal inference.
 - **`failures`** — one `{"run_id", "edge_id", "detail"}` dict per transition event whose `metric["passed"]` is falsy, built while iterating runs in `load_runs` order (and events in file order within each run), then **hard-capped to the first twelve** via `failures[:12]`. `incomplete_runs` and every per-edge count in `edges` are **not** capped — only the `failures` list is truncated.
 
 ## Offline refinement gate

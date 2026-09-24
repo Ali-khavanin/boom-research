@@ -1,0 +1,97 @@
+workspace = ".ragent/e2e-process-aware"
+
+[research]
+query = "Process-aware intelligence for agentic environments: how Hermes and agent harnesses work and optimize trajectories"
+graph_path = ".ragent/graph.json"
+skill_path = ".ragent/skills/SKILL.md"
+max_steps = 24
+min_sources = 6
+report = true
+obsidian = true
+instructions = """
+Produce a focused narrative literature and implementation review, not an exhaustive systematic review.
+Distinguish Nous Research Hermes Agent from Hermes model families.
+Explain execution state, tool loops, planning, memory and skill creation/retrieval, context compression,
+trajectory capture, feedback/evaluation, workflow reuse, and failure recovery.
+Compare Hermes Agent with documented Claude Code and OpenAI Codex harness mechanisms; distinguish
+inference-time workflow improvements from model training and measured results from project claims.
+Search at least the topics: Hermes agent skills memory trajectory optimization;
+agent harness trajectory optimization context management evaluation;
+process-aware agent skill graph workflow memory.
+Read at least six distinct relevant sources, preferring official repositories/docs and original papers.
+Use source-type/credibility screening and a synthesis matrix: source/date, purpose, mechanism,
+evidence/evaluation, limitations, similarities, differences. Include Graph of Thoughts as a comparison,
+not as a claim about this application's execution. Cite factual claims; label inference and unknowns.
+Keep the existing Goal/Prior Work/Limitations/Gaps/Feasibility/Quick Test report structure.
+Within Prior Work include the architecture comparison and synthesis matrix.
+"""
+
+[budget]
+strict = true
+cost_limit_usd = 3.50
+persist = true
+warn_fraction = 0.8
+
+[search]
+backend = "ddg"
+max_results = 6
+
+[obsidian]
+backend = "vault"
+layout = "bundle"
+vault_path = "/Users/alismac/Documents/gapido"
+folder = "Research/Process-Aware Intelligence"
+tags = ["research", "process-aware-intelligence", "agentic-systems", "trajectory-optimization"]
+related_notes = [
+  "master thesis/Process-Aware Skill Graphs for LLM Agents",
+  "LoopEngineering/SelfImprovment(Hermes Novelty)"
+]
+
+[roles.book_to_skill]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+temperature = 0.1
+max_tokens = 16384
+reasoning_max_tokens = 2048
+
+[roles.graph_builder]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+temperature = 0.1
+max_tokens = 16384
+reasoning_max_tokens = 2048
+
+[roles.executor]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+temperature = 0.1
+max_tokens = 16384
+reasoning_max_tokens = 2048
+
+[roles.report]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+temperature = 0.1
+max_tokens = 16384
+reasoning_max_tokens = 2048
+
+[roles.obsidian]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+temperature = 0.1
+max_tokens = 16384
+reasoning_max_tokens = 2048
+
+[roles.refiner]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+temperature = 0.1
+max_tokens = 16384
+reasoning_max_tokens = 2048
+
+[roles.judge]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+temperature = 0.1
+max_tokens = 16384
+reasoning_max_tokens = 2048
