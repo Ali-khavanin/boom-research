@@ -114,7 +114,9 @@ structured output, and reasoning; fit the output cap; charge no request/unsuppor
 stay at or below catalog prompt/completion prices. The reservation uses the maximum advertised
 context multiplied by catalog prompt price plus effective `max_tokens` multiplied by completion
 price. OpenRouter requests use `provider.only`, `max_price` in USD per million, `request=0`,
-`require_parameters=true`, and `allow_fallbacks=false`.
+`require_parameters=true`, and `allow_fallbacks=true` — fallback stays confined to the price/
+capability-vetted `only` set, so any endpoint that serves the request is still bounded by the
+catalog-price reservation.
 
 A strict provider completion is exactly one HTTP POST: transport retries and the ordinary HTTP-400
 schema-removal retry are disabled. Timeout, malformed response, missing usage, token/cost overflow,

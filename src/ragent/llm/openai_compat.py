@@ -139,7 +139,7 @@ class OpenAICompatProvider:
                     "request": "0",
                 },
                 "require_parameters": True,
-                "allow_fallbacks": False,
+                "allow_fallbacks": True,
             }
         try:
             data = self._post(payload)
