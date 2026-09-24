@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +30,9 @@ def _score(graph: Graph, cfg: Config) -> Scorecard:
     for query in load_eval_set():
         events: list[dict[str, Any]] = []
         try:
-            result = run(graph, query, cfg, on_event=events.append)
+            result = run(
+                graph, query, cfg, report=False, obsidian=False, on_event=events.append
+            )
             successes += int(result.reached_done)
         except Exception:
             pass
@@ -66,7 +68,9 @@ def gated(cfg: Config, candidate_graph: Path | Graph) -> dict[str, Any]:
     )
     candidate_audit = audit(candidate)
     if not candidate_audit.ok:
-        details = "; ".join(item.detail for item in candidate_audit.findings if item.level == "error")
+        details = "; ".join(
+            item.detail for item in candidate_audit.findings if item.level == "error"
+        )
         raise GraphError(f"candidate graph failed audit: {details}")
     baseline_score = _score(current, cfg)
     candidate_score = _score(candidate, cfg)
@@ -80,7 +84,7 @@ def gated(cfg: Config, candidate_graph: Path | Graph) -> dict[str, Any]:
         snapshot = _latest_snapshot(cfg.workspace)
         if snapshot is not None:
             shutil.copy2(snapshot, current_path)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     directory = cfg.workspace / "refine" / timestamp
     directory.mkdir(parents=True, exist_ok=True)
     record = {
@@ -89,5 +93,7 @@ def gated(cfg: Config, candidate_graph: Path | Graph) -> dict[str, Any]:
         "candidate": asdict(candidate_score),
         "threshold": {"success_drop": 0.0, "quality_drop": 0.02},
     }
-    (directory / "rollback.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+    (directory / "rollback.json").write_text(
+        json.dumps(record, indent=2), encoding="utf-8"
+    )
     return record

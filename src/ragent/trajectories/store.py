@@ -7,7 +7,6 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
-
 CSV_FIELDS = ("case_id", "activity", "timestamp", "step", "edge_id", "metric_passed")
 
 
@@ -52,16 +51,32 @@ def stats(workspace: Path) -> dict[str, Any]:
     incomplete: list[str] = []
     failures: list[dict[str, str]] = []
     for run_id, events in load_runs(workspace).items():
-        reached_done = False
+        metadata_path = workspace / "runs" / run_id / "run.json"
+        explicit_status: str | None = None
+        if metadata_path.is_file():
+            try:
+                value = json.loads(metadata_path.read_text(encoding="utf-8"))
+                explicit_status = str(value.get("status", ""))
+            except (OSError, json.JSONDecodeError, AttributeError):
+                explicit_status = "failed"
+        reached_done = explicit_status == "completed"
         for event in events:
             if edge_id := event.get("edge_id"):
                 edge_events[edge_id].append(event)
                 metric = event.get("metric", {})
                 if not metric.get("passed", False):
                     failures.append(
-                        {"run_id": run_id, "edge_id": edge_id, "detail": str(metric.get("detail", ""))}
+                        {
+                            "run_id": run_id,
+                            "edge_id": edge_id,
+                            "detail": str(metric.get("detail", "")),
+                        }
                     )
-                if event.get("target") == "done" and metric.get("passed", False):
+                if (
+                    explicit_status is None
+                    and event.get("target") == "done"
+                    and metric.get("passed", False)
+                ):
                     reached_done = True
         if not reached_done:
             incomplete.append(run_id)
@@ -71,6 +86,8 @@ def stats(workspace: Path) -> dict[str, Any]:
         per_edge[edge_id] = {
             "attempts": len(events),
             "pass_rate": passed / len(events),
-            "mean_artifact_size": mean(event.get("artifact_chars", 0) for event in events),
+            "mean_artifact_size": mean(
+                event.get("artifact_chars", 0) for event in events
+            ),
         }
     return {"edges": per_edge, "incomplete_runs": incomplete, "failures": failures[:12]}
