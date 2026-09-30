@@ -16,7 +16,8 @@ dependencies = [
   "pydantic>=2.7",
   "pypdf>=4.2",
   "jsonschema>=4.22",
-  "book-to-skill[pdf] @ git+https://github.com/virgiliojr94/book-to-skill.git@v1.4.0",
+  # Supplies extractor runtime dependencies for the interpreter passed as PYTHON_BIN.
+  "book-to-skill[pdf] @ git+https://github.com/virgiliojr94/book-to-skill.git@c108d25b0cb58e1bdc361f3de02ed9f37075152f",
   "tomli-w>=1.0",
   "platformdirs>=4",
   "trafilatura>=1.12",
