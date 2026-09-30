@@ -23,7 +23,7 @@ from textual.widgets import (
     Tree,
 )
 
-from ragent.book_to_skill import generate_skill
+from ragent.book_to_skill import find_skill, generate_skill
 from ragent.config import Config
 from ragent.errors import BudgetError
 from ragent.executor.runner import run
@@ -687,7 +687,7 @@ class ResearchApp(App[None]):
     def action_build_graph(self) -> None:
         try:
             graph = build_graph(
-                self.cfg.workspace / "skills",
+                find_skill(self.cfg.workspace / "skills"),
                 get_llm("graph_builder", cfg=self.cfg),
                 load_seed(),
             )

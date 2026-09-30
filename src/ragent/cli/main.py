@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.tree import Tree
 
-from ragent.book_to_skill import generate_skill
+from ragent.book_to_skill import find_skill, generate_skill
 from ragent.config import DEFAULT_CONFIG, Config, load_config, require_api_key
 from ragent.errors import GraphError, RagentError
 from ragent.executor.preflight import preflight
@@ -252,7 +252,7 @@ def graph_build(
 
         try:
             graph = build_graph(
-                skill_dir or state.cfg.workspace / "skills",
+                skill_dir or find_skill(state.cfg.workspace / "skills"),
                 get_llm("graph_builder", cfg=state.cfg),
                 load_seed(),
                 on_event=progress,

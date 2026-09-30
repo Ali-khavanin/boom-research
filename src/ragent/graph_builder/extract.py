@@ -3,17 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from ragent.book_to_skill import load_skill
 from ragent.errors import GraphError
 from ragent.llm.base import LLM, Message
 
 from .schema import Edge, Graph, Node, graph_schema, slug_id
 from .seed import load_seed
 from .validate import audit
-
-
-def _chapter_files(skill_dir: Path) -> list[Path]:
-    chapter_dir = skill_dir / "chapters"
-    return sorted(chapter_dir.glob("*.md")) if chapter_dir.exists() else []
 
 
 _GRAPH_KEYS = {"version", "entry", "nodes", "edges"}
@@ -98,7 +94,7 @@ def build_graph(
     node_ids = {node.id for node in base.nodes}
     edge_ids = {edge.id for edge in base.edges}
     pairs = {(edge.source, edge.target) for edge in base.edges}
-    files = _chapter_files(skill_dir)
+    files = load_skill(skill_dir).chapter_files
     _emit({"event": "graph_start", "chapters": len(files)})
     for position, path in enumerate(files):
         chapter = path.name
@@ -114,11 +110,15 @@ def build_graph(
         prompt = [
             Message(
                 "system",
-                "Compile a methodology chapter into a sound research-stage graph. Reuse the seed ids "
-                "start, goal, what_has_been_done, limitations, gaps, feasibility, quick_test, done whenever applicable. "
-                "Mine first/then/next/after as sequencing; if/unless/when as preconditions or loop-backs; "
-                "in order to/so that as prompt intent. Add a node only for a genuinely new stage. "
-                "Every non-seed node and edge needs provenance with chapter and the exact cue. "
+                "Compile one chapter file of a book-to-skill generated skill into a sound research-stage graph. "
+                "The chapter follows the book-to-skill template: Core Idea, Frameworks Introduced (each with "
+                "When to use and How), Key Concepts, Mental Models, Anti-patterns, optional Worked Example, "
+                "Key Takeaways, and Connects To. Treat each framework's How steps as ordered stages, its "
+                "When to use as the edge precondition or prompt intent, Anti-patterns as failure conditions "
+                "that justify on_fail loop-backs, and Key Takeaways as termination criteria. "
+                "Reuse the seed ids start, goal, what_has_been_done, limitations, gaps, feasibility, quick_test, "
+                "done whenever applicable. Add a node only for a genuinely new stage. Every non-seed node "
+                "and edge needs provenance with chapter and cue, where cue is an exact phrase copied from the chapter text. "
                 "Metric field rules: kinds min_words, min_items, and has_citations each require an integer n "
                 "(e.g. has_citations needs n = minimum citation count); kind regex requires pattern; "
                 "kind llm_rubric requires rubric. "
