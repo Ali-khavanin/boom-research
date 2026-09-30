@@ -11,7 +11,6 @@ from pydantic import BaseModel, Field, model_validator
 from ragent.errors import ProviderError
 
 RoleName: TypeAlias = Literal[
-    "book_to_skill",
     "graph_builder",
     "executor",
     "report",
@@ -20,7 +19,6 @@ RoleName: TypeAlias = Literal[
     "judge",
 ]
 ROLE_NAMES: tuple[str, ...] = (
-    "book_to_skill",
     "graph_builder",
     "executor",
     "report",
@@ -28,6 +26,22 @@ ROLE_NAMES: tuple[str, ...] = (
     "refiner",
     "judge",
 )
+
+DEFAULT_BOOK_AGENT: tuple[str, ...] = (
+    "hermes", "--skills", "book-to-skill", "-z", "{prompt}"
+)
+
+
+class BookCfg(BaseModel):
+    agent: list[str] = Field(default_factory=lambda: list(DEFAULT_BOOK_AGENT))
+
+    @model_validator(mode="after")
+    def validate_agent(self) -> BookCfg:
+        if not self.agent or not any("{prompt}" in part for part in self.agent):
+            raise ValueError(
+                "book.agent must be a command list containing a {prompt} placeholder"
+            )
+        return self
 
 
 class ProviderCfg(BaseModel):
@@ -97,6 +111,7 @@ class Config(BaseModel):
     workspace: Path = Path(".ragent")
     providers: dict[str, ProviderCfg]
     roles: dict[RoleName, RoleCfg]
+    book: BookCfg = Field(default_factory=BookCfg)
     search: SearchCfg = Field(default_factory=SearchCfg)
     obsidian: ObsidianCfg = Field(default_factory=ObsidianCfg)
     budget: BudgetCfg = Field(default_factory=BudgetCfg)
@@ -138,6 +153,7 @@ class Config(BaseModel):
 
 DEFAULT_CONFIG: dict = {
     "workspace": ".ragent",
+    "book": {"agent": list(DEFAULT_BOOK_AGENT)},
     "providers": {
         "openrouter": {
             "kind": "openrouter",

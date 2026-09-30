@@ -21,15 +21,11 @@ api_key_env = "GOOGLE_API_KEY"
 # with input_per_mtok/output_per_mtok, otherwise their spend shows as "calls unpriced"
 # and does not count toward cost_limit_usd.
 
-[roles.book_to_skill]
-provider = "openrouter"
-model = "z-ai/glm-5.3-flash"
-# glm-5.3-flash is a reasoning model: it spends completion tokens on chain-of-thought
-# before emitting the actual chapter/JSON. Measured empty output at 3072 and 8192 on the
-# largest chapter (17.8k source chars needed 10.5k completion tokens) — 16384 gives headroom
-# for reasoning + real content on the biggest chapters in this book.
-max_tokens = 16384
-temperature = 0.1
+# Conversion is owned by the upstream book-to-skill agent skill at c108d25,
+# run headlessly by a host agent. {prompt} is replaced by the /book-to-skill request.
+# Install the skill in the host (Hermes: ~/.hermes/skills/<category>/book-to-skill).
+[book]
+agent = ["hermes", "--skills", "book-to-skill", "-z", "{prompt}"]
 
 [roles.graph_builder]
 provider = "openrouter"

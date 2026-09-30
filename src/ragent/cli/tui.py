@@ -23,7 +23,7 @@ from textual.widgets import (
     Tree,
 )
 
-from ragent.book_to_skill import build as build_skill
+from ragent.book_to_skill import generate_skill
 from ragent.config import Config
 from ragent.errors import BudgetError
 from ragent.executor.runner import run
@@ -484,20 +484,16 @@ class ResearchApp(App[None]):
         log = self.query_one("#log", RichLog)
         kind = event.get("event")
         if kind == "book_start":
-            log.write(f"book: {event['chapters']} chapters from {event['pdf']}")
-        elif kind == "chapter_start":
-            suffix = " (cached)" if event.get("cached") else ""
             log.write(
-                f"chapter {event['index']}/{event['total']}: {event['title']}{suffix}"
+                f"book-to-skill via {event['agent']}: {event['pdf']} -> {event['skill_dir']}"
             )
-        elif kind == "chapter_done":
-            log.write(f"  wrote {event['path']}")
-        elif kind == "skill_start":
-            log.write(
-                "SKILL.md: cached" if event.get("cached") else "SKILL.md: synthesizing"
-            )
+        elif kind == "agent_output":
+            log.write(Text(event["line"]))
         elif kind == "skill_done":
-            log.write(f"SKILL.md: {event['path']}")
+            log.write(
+                f"skill: {event['path']} ({event['chapters']} chapters"
+                f"{', cached' if event['cached'] else ''})"
+            )
         elif kind == "graph_start":
             self.graph = load_seed()
             self._render_graph_tree()
@@ -677,13 +673,12 @@ class ResearchApp(App[None]):
             )
             return
         try:
-            bundle = build_skill(
-                path,
-                self.cfg.workspace / "skills",
-                get_llm("book_to_skill", cfg=self.cfg),
+            emit = lambda event: self.post_message(PipelineMsg(event))
+            skill = generate_skill(
+                path, self.cfg.workspace / "skills", self.cfg.book, on_event=emit
             )
             self.post_message(
-                ArtifactMsg("SKILL.md", bundle.skill_file.read_text(encoding="utf-8"))
+                ArtifactMsg("SKILL.md", skill.skill_file.read_text(encoding="utf-8"))
             )
         except Exception as exc:
             self.post_message(TransitionMsg({"detail": f"{type(exc).__name__}: {exc}"}))
@@ -716,17 +711,16 @@ class ResearchApp(App[None]):
     @work(thread=True, exclusive=True)
     def run_pipeline(self, raw: str) -> None:
         pdf = Path(raw).expanduser()
-        skills = self.cfg.workspace / "skills"
         emit = lambda event: self.post_message(PipelineMsg(event))
         try:
-            bundle = build_skill(
-                pdf, skills, get_llm("book_to_skill", cfg=self.cfg), on_event=emit
+            skill = generate_skill(
+                pdf, self.cfg.workspace / "skills", self.cfg.book, on_event=emit
             )
             self.post_message(
-                ArtifactMsg("SKILL.md", bundle.skill_file.read_text(encoding="utf-8"))
+                ArtifactMsg("SKILL.md", skill.skill_file.read_text(encoding="utf-8"))
             )
             build_graph(
-                skills,
+                skill.root,
                 get_llm("graph_builder", cfg=self.cfg),
                 load_seed(),
                 on_event=emit,

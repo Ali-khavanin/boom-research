@@ -3,7 +3,7 @@ workspace = ".ragent/e2e-process-aware"
 [research]
 query = "Process-aware intelligence for agentic environments: how Hermes and agent harnesses work and optimize trajectories"
 graph_path = ".ragent/graph.json"
-skill_path = ".ragent/skills/SKILL.md"
+skill_path = ".ragent/skills/08ijbas31/SKILL.md"
 max_steps = 24
 min_sources = 6
 report = true
@@ -46,13 +46,6 @@ related_notes = [
   "master thesis/Process-Aware Skill Graphs for LLM Agents",
   "LoopEngineering/SelfImprovment(Hermes Novelty)"
 ]
-
-[roles.book_to_skill]
-provider = "openrouter"
-model = "z-ai/glm-5.3-flash"
-temperature = 0.1
-max_tokens = 16384
-reasoning_max_tokens = 2048
 
 [roles.graph_builder]
 provider = "openrouter"

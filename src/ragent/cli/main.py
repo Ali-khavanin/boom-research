@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.tree import Tree
 
-from ragent.book_to_skill import build as build_skill
+from ragent.book_to_skill import generate_skill
 from ragent.config import DEFAULT_CONFIG, Config, load_config, require_api_key
 from ragent.errors import GraphError, RagentError
 from ragent.executor.preflight import preflight
@@ -185,8 +185,11 @@ def providers_check(ctx: typer.Context) -> None:
 def book_command(
     ctx: typer.Context,
     pdf: Path,
-    out: Annotated[Path | None, typer.Option("--out")] = None,
+    out: Annotated[Path | None, typer.Option("--out", help="Skills root directory")] = None,
     force: Annotated[bool, typer.Option("--force")] = False,
+    name: Annotated[str | None, typer.Option("--name")] = None,
+    mode: Annotated[str, typer.Option("--mode")] = "text",
+    depth: Annotated[str, typer.Option("--depth")] = "study",
 ) -> None:
     state = _state(ctx)
     if not pdf.exists():
@@ -194,26 +197,29 @@ def book_command(
     target = out or state.cfg.workspace / "skills"
 
     def progress(event: dict) -> None:
-        if event["event"] == "chapter_start":
-            suffix = " (cached)" if event["cached"] else ""
+        if event["event"] == "book_start":
             console.print(
-                f"chapter {event['index']}/{event['total']}: {event['title']}{suffix}"
+                f"book-to-skill via {event['agent']}: {event['pdf']} -> {event['skill_dir']}"
             )
-        elif event["event"] == "chapter_done":
-            console.print(f"  → {event['path']}")
-        elif event["event"] == "skill_start":
-            console.print("synthesizing SKILL.md")
+        elif event["event"] == "agent_output":
+            console.print(event["line"], markup=False, highlight=False)
+        elif event["event"] == "skill_done":
+            console.print(
+                f"skill: {event['path']}" + (" (cached)" if event["cached"] else "")
+            )
 
-    bundle = build_skill(
+    skill = generate_skill(
         pdf,
         target,
-        get_llm("book_to_skill", cfg=state.cfg),
+        state.cfg.book,
+        name=name,
+        mode=mode,
+        depth=depth,
         force=force,
         on_event=progress,
     )
-    console.print(f"skill: {bundle.skill_file}")
-    console.print(f"chapters: {len(bundle.chapter_files)}")
-    console.print(get_ledger(state.cfg).status_line())
+    console.print(f"chapters: {len(skill.chapter_files)}")
+    console.print(f"supporting: {', '.join(path.name for path in skill.supporting_files)}")
 
 
 @graph_app.command("build")
