@@ -1,394 +1,147 @@
 # Document to Skill Graph
 
-This page documents the four-stage pipeline that turns a methodology PDF into an
-executable stage graph: PDF text extraction, chapter segmentation, LLM
-distillation into skill chapters plus `SKILL.md`, and the merge of those
-chapters into `graph.json`. See [algorithm.md](algorithm.md) for how the
-resulting graph is executed and [skill-graph.md](skill-graph.md) for the graph
-schema and soundness rules.
+Upstream `book-to-skill` owns the entire PDF-to-skill conversion: extraction,
+chapter selection, and skill generation. `ragent` invokes a host agent following
+upstream's `SKILL.md`, validates its artifacts, then compiles its chapters into
+`graph.json`. See [algorithm.md](algorithm.md) for graph execution and
+[skill-graph.md](skill-graph.md) for the graph schema and soundness rules.
 
-## 4.1 Text extraction
+## 4.1 Upstream ownership and installation
 
-`src/ragent/book_to_skill/pdf.py` is a thin adapter over the pinned upstream
-`book-to-skill` package (`book-to-skill[pdf] @ git+...@v1.4.0`, installed as
-the `book_to_skill` distribution). The entire module:
+Both the extractor package and host skill are pinned to upstream commit
+`c108d25b0cb58e1bdc361f3de02ed9f37075152f`. Release `v1.4.0` has no Hermes
+support; this unreleased commit adds Hermes skill-root and extractor discovery.
+Neither version exposes a Python/CLI skill-generation API: generation is the
+host agent following [upstream's skill](https://github.com/virgiliojr94/book-to-skill/blob/c108d25b0cb58e1bdc361f3de02ed9f37075152f/SKILL.md).
+There is no ragent segmentation or chapter-distillation fallback.
 
-```python
-from book_to_skill import ExtractionError, extract_single_file
-...
-def extract(pdf: Path, mode: str = "text") -> ExtractedBook:
-    try:
-        result = extract_single_file(
-            pdf.expanduser().resolve(),
-            extraction_mode=mode,
-            install_mode="no",
-        )
-    except ExtractionError as exc:
-        raise RagentError(str(exc)) from exc
-    text = str(result.pop("text", "")).strip()
-    if not text:
-        raise RagentError(
-            f"no extractable text in {pdf}; run OCR on the scanned PDF first"
-        )
-    return ExtractedBook(
-        text=text,
-        pages=int(result.get("pages") or 0),
-        metadata=result,
-    )
+The Python dependency supplies extractor runtime packages (`pypdf`,
+`pdfminer.six`, `pdf-inspector`) for ragent's interpreter. The host skill clone
+is a separate prerequisite, outside the repository. Install Hermes, configure
+its model credentials, and put `hermes` on `PATH`, then:
+
+```bash
+git clone https://github.com/virgiliojr94/book-to-skill.git ~/.hermes/skills/research/book-to-skill
+git -C ~/.hermes/skills/research/book-to-skill checkout --detach c108d25b0cb58e1bdc361f3de02ed9f37075152f
+hermes skills list
 ```
 
-`extract_single_file` is called with the resolved absolute path,
-`extraction_mode=mode` (`ragent`'s `extract()` defaults `mode="text"`), and
-`install_mode="no"` — upstream is never allowed to auto-install missing
-system tools. Any `book_to_skill.ExtractionError` is caught and re-raised as
-`ragent.errors.RagentError` with the upstream message preserved verbatim
-(`str(exc)`). If upstream returns text that is empty after stripping, `pdf.py`
-raises its own error, exactly:
+If the clone already exists, run
+`git -C ~/.hermes/skills/research/book-to-skill fetch` instead of cloning,
+then the same checkout. `hermes skills list` must show `book-to-skill`.
+For an existing Python installation with the same upstream package version,
+verify `direct_url.json`; pip may retain `v1.4.0` despite the changed revision:
 
-```
-no extractable text in {pdf}; run OCR on the scanned PDF first
+```bash
+.venv/bin/python -c "import importlib.metadata as m; print(m.distribution('book-to-skill').read_text('direct_url.json'))"
 ```
 
-`ExtractedBook` (`dataclass(slots=True)`) has three fields: `text: str`,
-`pages: int`, `metadata: dict[str, Any]`. `metadata` is upstream's full result
-dict with the `"text"` key popped out — every other key upstream returns is
-passed through unchanged. Reading `extract_single_file` in the installed
-package (`book_to_skill/utils.py`), the dict it builds for any input format is:
+If it still names `v1.4.0`, replace just that package:
 
-```python
-{
-    "source_file": str(input_path.resolve()),
-    "filename": input_path.name,
-    "format": document_format,
-    "extraction_method": method,
-    "file_size_mb": round(file_size_mb, 2),
-    pages_label: pages,        # e.g. "pages": N for PDFs
-    "pages_label": pages_label,
-    "pages": pages,
-    "chars": len(text),
-    "words": len(text.split()),
-    "estimated_tokens": tokens,
-    "text": text,
-    **structure,                # chapters_detected, chapter_headings_sample, has_toc
-}
+```bash
+.venv/bin/pip install --force-reinstall --no-deps 'book-to-skill @ git+https://github.com/virgiliojr94/book-to-skill.git@c108d25b0cb58e1bdc361f3de02ed9f37075152f'
 ```
 
-So after `pdf.py` pops `"text"`, `ExtractedBook.metadata` for a PDF carries
-exactly: `source_file`, `filename`, `format`, `extraction_method`,
-`file_size_mb`, `pages_label` (the string `"pages"` for PDFs), `pages`,
-`chars`, `words`, `estimated_tokens`, `chapters_detected`,
-`chapter_headings_sample`, `has_toc`. Running `extract()` on the bundled
-`08IJBAS31.pdf` in this repo produced exactly this key set (verified this
-session; see §4.2 for the full worked run).
+## 4.2 Host-agent invocation
 
-The pdftotext -> pypdf -> pdfminer.six fallback chain, the image-only-PDF
-refusal, and the printed progress lines all belong to the pinned upstream
-package (`book_to_skill/utils.py` in the installed `book-to-skill` v1.4.0
-distribution), not to this repo's code — they are documented here as observed
-external behavior. For a PDF, upstream prints `Extracting PDF: <path>`, then
-in text mode tries each extractor in order, printing `Trying pdftotext... `
-followed by `OK` or `not available`, then (on failure) `Trying pypdf... `,
-then `Trying pdfminer.six... `, ending in `FAILED` plus an install-one-of
-message if none succeed. Before extraction it checks `looks_image_only()` and
-if true raises an `ExtractionError` whose message ends with:
+`src/ragent/book_to_skill/agent.py` exposes
+`generate_skill(source, skills_root, cfg, *, name=None, mode="text",
+depth="study", force=False, on_event=None) -> SkillArtifacts`.
+The source and skills root are expanded and resolved to absolute paths.
+`mode` accepts `text` or `technical`; `depth` accepts `study` or `reference`.
+The default name is the lowercased source stem with non-alphanumeric runs
+replaced by `-`, stripped and truncated to 64 characters. Explicit names must
+match `[a-z0-9]+(?:-[a-z0-9]+)*` and be at most 64 characters.
 
-```
-Run OCR on it first, then retry:
-  ocrmypdf input.pdf output.pdf
+```toml
+[book]
+agent = ["hermes", "--skills", "book-to-skill", "-z", "{prompt}"]
 ```
 
-Running `extract()` locally against `08IJBAS31.pdf` in this environment
-(`pdftotext` binary absent, `pypdf` present) actually printed:
+The command must be nonempty and contain `{prompt}` in at least one argument.
+Each occurrence is replaced with the full request; no shell is involved.
+Hermes `-z` runs headlessly and `--skills` preloads the installed upstream skill.
+Other hosts require changing this command and installing the same skill there.
+Host-agent spend is separate from ragent's usage ledger and budget.
 
-```
-Extracting PDF: .../08IJBAS31.pdf
-Mode: text — using pdftotext...
-Trying pdftotext... not available
-Trying pypdf... OK
-```
+### Request (verbatim for the default `text` / `study` options)
 
-with `extraction_method: "pypdf"` in the resulting metadata.
+`{source}`, `{slug}`, and `{skills_root}` are interpolated:
 
-## 4.2 Segmentation
+```text
+/book-to-skill "{source}" {slug}
 
-`src/ragent/book_to_skill/chapters.py`'s `segment(book: ExtractedBook) ->
-list[Chapter]` tries three strategies in this precedence order, falling
-through only when the higher-precedence strategy yields nothing usable.
-
-### Branch 1 — keyword headings
-
-```python
-_CHAPTER = re.compile(
-    r"(?im)^\s*(?:#{1,6}\s+)?"
-    r"((?:chapter|unit|lesson|module|lecture|part|section)\s+"
-    r"(?:\d{1,3}|[IVXLCDM]{1,7})\b[^\n]*)"
-)
+This is a non-interactive Full Conversion started by ragent; nobody can answer questions, so use these answers:
+- Step 1.5 content type: 2 (Text-heavy), so BOOK_TYPE=text.
+- Step 2.5 cost estimate: proceed with Full Conversion.
+- Step 4 purpose: 4 (All of the above), so DEPTH=study.
+- Step 5 destination: I explicitly request SKILLS_HOME="{skills_root}". Write the skill to "{skills_root}/{slug}/" exactly: no category subfolder, no symlink, no `hermes skills trust`, and nothing under ~/.hermes/skills or ~/.agents/skills.
+- Missing optional extractor packages: do not install them; use the available fallback.
+- Step 11 publish: skip.
 ```
 
-This matches, at line start (case-insensitive, multiline), an optional
-Markdown `#` prefix, then one of the keywords `chapter`, `unit`, `lesson`,
-`module`, `lecture`, `part`, `section` followed by an Arabic (`\d{1,3}`) or
-Roman (`[IVXLCDM]{1,7}`) numeral and the rest of that line. `segment()` uses
-this branch only when `len(matches) >= 2`; a single keyword hit is not enough
-to trust as chapter structure.
+`--mode technical` changes Step 1.5 to `1 (Technical), so BOOK_TYPE=technical`.
+`--depth reference` changes Step 4 to
+`3 (Reference specific chapters and concepts), so DEPTH=reference`.
 
-### Branch 2 — numbered sections
-
-```python
-_NUMBERED = re.compile(r"(?m)^[ \t]*(\d{1,2})[.)]?[ \t]+([A-Z][^\n]{2,80}?)[ \t]*$")
-```
-
-`_numbered_sections()` (module docstring: *"Longest ascending 1,2,3… run of
-numbered headings"*) runs, in order:
-
-1. **Collect** every regex match as `(number, start_offset, title)`, dropping
-   any `number > 20`.
-2. **Global uniqueness filter** — normalize each title
-   (`" ".join(title.lower().split())`), count occurrences across all
-   candidates, and keep only candidates whose normalized title occurs exactly
-   once. This removes repeated running headers/footers (a number that recurs
-   with the same title on many pages is not a real section boundary).
-3. **Build source-order consecutive runs** — walk the filtered candidates in
-   the order the regex found them; a candidate extends the current run only
-   if its number is exactly one more than the run's last number, otherwise it
-   starts a new run.
-4. **Qualify** — keep only runs whose first number is `1` and whose length is
-   `>= 3` (`qualifying = [run for run in runs if run[0][0] == 1 and len(run) >= 3]`).
-   No qualifying run -> the branch returns `[]` and `segment()` falls through
-   to block splitting.
-5. **Pick the winner** — `qualifying.sort(key=lambda run: run[0][1])` sorts
-   qualifying runs by the character offset of their first heading, then
-   `return qualifying[-1]` returns the **last** one in that order.
-
-**Verified discrepancy:** step 5 selects the run whose `1` starts **latest**
-in the document, not the longest run — despite the function's own docstring
-and inline comment (`"Longest ascending ... run"`) claiming length wins. Any
-qualifying run tied for "starts last" beats a qualifying run that is merely
-longer but starts earlier. This documents the code's actual behavior, which
-is what `ragent` runs; the docstring is stale. Practically this means a short
-`1./2./3.` author-affiliation or acknowledgments block that happens to sit
-later in the source text can still lose to an earlier, longer body-section
-run only if the body run itself starts later — and conversely a late, short
-qualifying run (e.g., trailing numbered appendix items) can beat an earlier,
-longer body-section run.
-
-### Branch 3 — fixed-size blocks (fallback)
-
-```python
-block_count = detected or max(1, math.ceil((book.pages or 12) / 12))
-block_size = max(1, math.ceil(len(book.text) / block_count))
-```
-
-where `detected = int(book.metadata.get("chapters_detected") or 0)`. Chapters
-are titled `Section 1`, `Section 2`, … and text is sliced into `block_size`
-windows in character order.
-
-### Front Matter prepending
-
-Both the keyword-heading and numbered-section branches prepend a synthetic
-`Front Matter` chapter — `text[: matches[0].start()]` / `text[: sections[0][1]]`
-— only when the first detected heading starts **beyond character offset
-500**. This skips the synthetic chapter when the document's real structure
-begins immediately (no meaningful preamble to capture) and only pages
-title/author/abstract text into its own chapter when there is a nontrivial
-prefix in front of the first heading. Empty resulting chapter bodies (after
-`.strip()`) are skipped in every branch (`if text:` guards); the fallback
-block branch has no such check since blocks are lengths, not delimiter-based.
-
-### `Chapter` and page-range estimation
-
-```python
-@dataclass(slots=True)
-class Chapter:
-    index: int
-    title: str
-    text: str
-    pages: list[int]
-```
-
-`_page_range(book, start, end)` returns `[]` if `book.pages <= 0` or the text
-is empty; otherwise it estimates a page range purely from the **proportion of
-character offset within the extracted text**, not from any real per-page
-provenance the extractor tracked:
-
-```python
-first = max(1, math.floor(start / len(book.text) * book.pages) + 1)
-last = min(book.pages, max(first, math.ceil(end / len(book.text) * book.pages)))
-return list(range(first, last + 1))
-```
-
-Because upstream's extractors (pdftotext/pypdf/pdfminer) do not preserve
-page-boundary markers in the returned plain text, this is the only page
-estimate available; it is linear-interpolated, not extracted.
-
-### Worked example (`08IJBAS31.pdf`, bundled in the repo root)
-
-Running `ragent.book_to_skill.pdf.extract()` then
-`ragent.book_to_skill.chapters.segment()` locally against the bundled PDF
-(pure text extraction and regex — no LLM call, no network) in this
-environment produced the numbered-section branch's winning run (`pages: 10`,
-`chapters_detected: 0`, so branch 1 did not fire with >=2 matches and branch 3
-never ran):
-
-| index | title | chars | estimated pages |
-|---|---|---|---|
-| 1 | `Front Matter` | 1483 | `[1]` |
-| 2 | `1 Introduction` | 2096 | `[1, 2]` |
-| 3 | `2 What is a Literature Review` | 3440 | `[2, 3]` |
-| 4 | `3 Systematic Literature Review` | 2042 | `[3]` |
-| 5 | `4 Steps in the Literature Review Process` | 17776 | `[3, 4, 5, 6, 7, 8, 9]` |
-| 6 | `5 Conclusion` | 3461 | `[9, 10]` |
-
-`extraction_method` was `pypdf` in this run (`pdftotext` binary not present
-on this machine; `pypdf` succeeded). This is one run's output, not a
-guaranteed-stable fixture — re-running against a different-PDF fixture will
-segment differently, but the branch precedence and selection rules above are
-exact.
-
-## 4.3 Chapter distillation and `SKILL.md`
-
-`src/ragent/book_to_skill/writer.py`'s
-`build(pdf, out_dir, llm, force=False, on_event=None) -> SkillBundle` drives
-one LLM call per chapter plus one summary call.
-
-### Chapter prompt (verbatim)
-
-System message:
-
-```
-Convert research-methodology source text into an executable skill chapter. Do not invent methods or evidence.
-```
-
-User message template (`f"..."`, `chapter.title`/`chapter.pages` interpolated,
-followed by the truncated chapter text):
-
-```
-Write Markdown with these sections: Purpose, When to use, Ordered procedure, Decision rules, and Discourse cues. Preserve relevant cue words verbatim, especially first, then, before, if, unless, in order to, so that, and until.
-Source title: {chapter.title}
-Source pages: {chapter.pages}
-
-{truncated chapter text}
-```
-
-### SKILL.md prompt (verbatim)
-
-System message:
-
-```
-Synthesize chapter skills into one faithful end-to-end research procedure. Keep stage order, decision rules, loops, and source chapter links explicit.
-```
-
-User message (chapter bodies joined with a blank line, appended after the
-instruction):
-
-```
-Produce the body of SKILL.md in Markdown. Include Overview, End-to-end procedure, Decision points, and Chapters. Do not add YAML front matter.
-
-{rendered chapter bodies joined by "\n\n"}
-```
-
-### Cue words
-
-```python
-_CUES = ("first", "then", "before", "if", "unless", "in order to", "so that", "until")
-```
-
-`_stage_hints(chapter)` lowercases the chapter text once and returns the
-subset of `_CUES` present as a substring (`[cue for cue in _CUES if cue in
-lowered]`), preserving `_CUES` order — this list becomes each chapter's
-`stage_hints` front-matter value.
-
-### File paths and slugs
-
-Chapter files are written to `chapters/{chapter.index:02d}-{_slug(chapter.title)}.md`.
-`_slug`:
-
-```python
-def _slug(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    return slug[:72] or "section"
-```
-
-— lowercase, non-alphanumeric runs collapsed to a single `-`, leading/trailing
-`-` stripped, truncated to 72 characters, falling back to the literal
-`"section"` if the result is empty.
-
-### Front matter
-
-Every chapter file is written as:
-
-```
----
-name: <json.dumps(chapter.title)>
-source_pages: <json.dumps(chapter.pages)>
-stage_hints: <json.dumps(_stage_hints(chapter))>
----
-
-{llm chapter content}
-```
-
-All three values are `json.dumps`-encoded (so a title containing a quote or
-Unicode is a valid inline JSON scalar within the YAML block, not raw text).
-`SKILL.md`'s front matter is analogous but with different keys — `name`
-(`json.dumps(pdf.stem)`), `description`
-(`json.dumps("Research methodology extracted from " + pdf.name)`), and
-`chapters` (`json.dumps([str(path.relative_to(out_dir)) for path in paths])`,
-i.e. the list of chapter-relative paths, encoded once as a single JSON array
-literal).
-
-### Truncation
-
-```python
-def _truncate(text: str) -> str:
-    if len(text) <= 24_000:
-        return text
-    return text[:16_000] + "\n\n[...middle omitted...]\n\n" + text[-8_000:]
-```
-
-Chapter text at or under 24,000 characters is sent to the LLM unchanged;
-longer text is cut to its first 16,000 and last 8,000 characters with a
-`[...middle omitted...]` marker in between. Only the chapter-generation
-prompt truncates; the SKILL.md prompt concatenates already-generated
-(LLM-authored, therefore already-bounded) chapter bodies without further
-truncation.
-
-### Cache semantics
-
-Per chapter: `cached = path.exists() and not force`. If cached, the file is
-read verbatim from disk with **no freshness check** against the source PDF or
-chapter text — a stale chapter file is trusted as-is until `force=True`.
-`SKILL.md` has an **independent** cache flag, `skill_cached =
-skill_path.exists() and not force`, computed once after the entire chapter
-loop and checked before the summary call. Because it does not depend on
-whether any individual chapter was regenerated this run, regenerating one
-chapter (e.g. by deleting just that chapter's file) leaves a stale
-`SKILL.md` untouched unless `--force` is also passed — `--force` is therefore
-the only way to guarantee both chapters and `SKILL.md` are rebuilt together.
-
-### `on_event` payloads
-
-Read directly from the five `_emit(...)` call sites in `build()`:
+The subprocess runs with `cwd=skills_root`, inherited environment plus
+`PYTHON_BIN=sys.executable`, `BOOK_SKILL_INSTALL_MISSING=no`, and the interpreter's
+directory prepended to `PATH`. Both interpreter settings make the upstream
+extractor use ragent's virtual environment. stdout and stderr are combined,
+decoded as UTF-8 with replacement, and streamed line by line. There is no
+timeout; the user can interrupt. A nonzero exit raises
+`book-to-skill agent exited with status N`. A missing executable raises an
+actionable `PATH` error naming `[book].agent`.
 
 | event | keys |
 |---|---|
-| `book_start` | `event`, `pdf`, `chapters` |
-| `chapter_start` | `event`, `index`, `total`, `title`, `chars`, `cached` |
-| `chapter_done` | `event`, `index`, `total`, `title`, `path`, `cached` |
-| `skill_start` | `event`, `cached` |
-| `skill_done` | `event`, `path` |
+| `book_start` | `event`, `pdf`, `skill_dir`, `agent` |
+| `agent_output` | `event`, `line` |
+| `skill_done` | `event`, `path`, `chapters`, `cached` |
 
-`_emit` wraps every call to `on_event` in a bare `try/except Exception: pass`,
-so a raising subscriber (a broken progress UI) is silently swallowed and
-never aborts the underlying (potentially paid) LLM run:
+Subscriber exceptions are swallowed so a broken progress display does not
+abort conversion. The CLI and TUI render agent output literally, not as Rich
+markup. `ragent book` prints chapter/supporting-file counts, not a usage ledger.
 
-```python
-def _emit(payload: dict[str, Any]) -> None:
-    if on_event is None:
-        return
-    try:
-        on_event(payload)
-    except Exception:
-        pass
+## 4.3 Generated artifact contract
+
+```text
+<skills_root>/<slug>/
+  SKILL.md
+  chapters/ch<NN>-<slug>.md
+  glossary.md
+  patterns.md
+  cheatsheet.md
+```
+
+Upstream's `SKILL.md` has `name` and `description` front matter. Chapters have
+no front matter and follow Core Idea, Frameworks Introduced (When to use / How),
+Key Concepts, Mental Models, Anti-patterns, optional Worked Example, Key
+Takeaways, and Connects To.
+
+`src/ragent/book_to_skill/skill.py` defines `SkillArtifacts(root, skill_file,
+chapter_files, supporting_files)` and `load_skill(root)`. It requires `SKILL.md`
+and all three supporting files to be files, plus at least one chapter matching
+`^ch(\d+)-.+\.md$`. It ignores other chapter-directory entries and sorts by
+`(int(chapter_number), filename)`, so `ch2` precedes `ch10`. Missing artifacts
+raise `incomplete book-to-skill output in <root>: missing <names>`; an absent
+chapter directory is reported as missing `chapters/ch<NN>-<slug>.md`.
+This validates layout, not content quality or upstream heading completeness.
+
+An existing target without `--force` is validated and returned with a cached
+`skill_done` event, without invoking the host or checking source freshness.
+An incomplete target is an error, not a cache miss. `--force` deletes that
+target directory before generating the complete skill again.
+
+`find_skill(skills_root)` discovers immediate `*/SKILL.md` candidates. Exactly
+one is required; zero reports how to run `ragent book` or pass `--skill-dir`,
+and multiple candidates are named in an error requesting `--skill-dir`.
+The CLI resolves this default only when extending the graph.
+
+Validate upstream content separately with:
+
+```bash
+.venv/bin/python ~/.hermes/skills/research/book-to-skill/tools/validate_skill.py --lens hermes .ragent/skills/08ijbas31/SKILL.md
 ```
 
 ## 4.4 Chapter to graph merge
@@ -412,16 +165,18 @@ and no audit runs.
 
 ### Per-chapter loop
 
-Chapter files come from `sorted((skill_dir / "chapters").glob("*.md"))` (empty
-list if the directory does not exist), so chapters are always processed in
-filename order — the same `NN-slug.md` order `writer.py` wrote them in.
+Chapter files come from `load_skill(skill_dir).chapter_files`: a complete
+upstream skill is required before any LLM call, and `ch<NN>-*.md` files are
+processed in numeric chapter order. `SKILL.md`, `glossary.md`, `patterns.md`,
+and `cheatsheet.md` are validated but not compiled: they index or summarize
+the chapters and would duplicate their graph contributions.
 
 ### Per-chapter graph-compilation prompt (verbatim)
 
 System message:
 
 ```
-Compile a methodology chapter into a sound research-stage graph. Reuse the seed ids start, goal, what_has_been_done, limitations, gaps, feasibility, quick_test, done whenever applicable. Mine first/then/next/after as sequencing; if/unless/when as preconditions or loop-backs; in order to/so that as prompt intent. Add a node only for a genuinely new stage. Every non-seed node and edge needs provenance with chapter and the exact cue. Metric field rules: kinds min_words, min_items, and has_citations each require an integer n (e.g. has_citations needs n = minimum citation count); kind regex requires pattern; kind llm_rubric requires rubric. Connectivity is mandatory: your JSON is merged as-is, with no cross-chapter wiring added afterward. Every node you include (seed or new) must sit on at least one edge path that starts at a seed node reachable from 'start' and ends at 'done'. Never add a node with no outgoing edge unless it is 'done' itself; never add a node with no incoming edge from 'start' or another node already on such a path. If a new node does not chain forward to 'done', omit it rather than leave it disconnected.
+Compile one chapter file of a book-to-skill generated skill into a sound research-stage graph. The chapter follows the book-to-skill template: Core Idea, Frameworks Introduced (each with When to use and How), Key Concepts, Mental Models, Anti-patterns, optional Worked Example, Key Takeaways, and Connects To. Treat each framework's How steps as ordered stages, its When to use as the edge precondition or prompt intent, Anti-patterns as failure conditions that justify on_fail loop-backs, and Key Takeaways as termination criteria. Reuse the seed ids start, goal, what_has_been_done, limitations, gaps, feasibility, quick_test, done whenever applicable. Add a node only for a genuinely new stage. Every non-seed node and edge needs provenance with chapter and cue, where cue is an exact phrase copied from the chapter text. Metric field rules: kinds min_words, min_items, and has_citations each require an integer n (e.g. has_citations needs n = minimum citation count); kind regex requires pattern; kind llm_rubric requires rubric. Connectivity is mandatory: your JSON is merged as-is, with no cross-chapter wiring added afterward. Every node you include (seed or new) must sit on at least one edge path that starts at a seed node reachable from 'start' and ends at 'done'. Never add a node with no outgoing edge unless it is 'done' itself; never add a node with no incoming edge from 'start' or another node already on such a path. If a new node does not chain forward to 'done', omit it rather than leave it disconnected.
 ```
 
 User message (`f"..."`, interpolating `sorted(node_ids)` — the ids merged so
@@ -553,7 +308,7 @@ of removing one of its endpoint nodes, never removed on its own.
 ### Event contract
 
 Four event kinds, `_emit` swallowing subscriber exceptions exactly as in
-`writer.py` (§4.3):
+`agent.py` (§4.2):
 
 | event | keys |
 |---|---|

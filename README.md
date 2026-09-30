@@ -1,17 +1,17 @@
 # Research Skill-Graph Agent
 
-`ragent` turns a research-methodology document into an executable, audited procedure: a PDF is
-extracted and segmented into chapters, chapters are distilled into skill Markdown and merged onto a
-seed research-stage graph, `ragent graph audit` proves the graph is sound (no dead ends, every node
-reaches `done`), and `ragent research` executes queries by walking that graph one metric-gated
-transition at a time. Every step is appended to a JSONL trajectory that can be exported to CSV for
-process-mining tools, and an offline, rollback-gated pipeline can propose graph edits from aggregated
-trajectory statistics.
+`ragent` turns a research-methodology document into an executable, audited procedure:
+upstream `book-to-skill` converts the PDF into a complete skill through a host agent,
+then ragent compiles its chapters onto a seed research-stage graph. `ragent graph audit`
+checks graph soundness (no dead ends, every node reaches `done`), and `ragent research`
+executes queries by walking that graph one metric-gated transition at a time.
+Every step is appended to a JSONL trajectory for export and offline graph refinement.
 
-Document extraction uses the MIT-licensed [`virgiliojr94/book-to-skill`](https://github.com/virgiliojr94/book-to-skill)
-package directly (`extract_single_file` and its extractor/sanitizer pipeline); `ragent` adds
-role-configurable skill generation, the stage graph, the metric-gated executor, and the trajectory/
-refinement tooling around it.
+The MIT-licensed [`virgiliojr94/book-to-skill`](https://github.com/virgiliojr94/book-to-skill)
+owns extraction, chapter selection, and skill generation. Its Python package supplies
+extractor dependencies; generation is a host agent following upstream's `SKILL.md`,
+not a Python generation API. ragent owns artifact validation, graph compilation,
+the metric-gated executor, and trajectory/refinement tooling.
 
 ## Install
 
@@ -23,10 +23,23 @@ python3 -m venv .venv
 pip install -e .
 ```
 
-`pyproject.toml` pulls one dependency straight from GitHub:
-`book-to-skill[pdf] @ git+https://github.com/virgiliojr94/book-to-skill.git@v1.4.0`. If that clone
-fails with a TLS/network error, the failure is transient — re-run the same `pip install -e .`
-command.
+`pyproject.toml` pins `book-to-skill[pdf]` to Git commit
+`c108d25b0cb58e1bdc361f3de02ed9f37075152f`. This unreleased revision adds Hermes
+support missing from `v1.4.0`. GitHub access is required during installation.
+
+**PDF conversion prerequisite:** install/configure Hermes, put `hermes` on `PATH`,
+and install the upstream skill at the same revision:
+
+```bash
+git clone https://github.com/virgiliojr94/book-to-skill.git ~/.hermes/skills/research/book-to-skill
+git -C ~/.hermes/skills/research/book-to-skill checkout --detach c108d25b0cb58e1bdc361f3de02ed9f37075152f
+hermes skills list
+```
+
+The list must contain `book-to-skill`. See [the conversion guide](docs/book-to-skill.md)
+for existing-clone updates and checking/upgrading a same-version Python installation.
+Hermes uses its own configured model and credentials; its spend is not recorded or
+limited by ragent's usage ledger.
 
 Installing registers the `ragent` console script (`[project.scripts] ragent =
 "ragent.cli.main:entrypoint"`). The distribution is `research-skill-agent` version `0.1.0`.
@@ -56,8 +69,8 @@ errors — check `ragent providers check` output first.
 ```bash
 ragent init                       # writes ragent.toml (if absent), .env.example, workspace dirs
 ragent providers check            # pings every configured provider, prints role → provider/model
-ragent book ./paper.pdf           # PDF -> .ragent/skills/{SKILL.md, chapters/*.md}
-ragent graph build                # skills/ -> .ragent/graph.json (merged onto the seed graph)
+ragent book ./paper.pdf           # PDF -> .ragent/skills/paper/{SKILL.md,chapters/,glossary.md,patterns.md,cheatsheet.md}
+ragent graph build                # the sole generated skill -> .ragent/graph.json
 ragent research "your query"      # walks the graph, writes .ragent/runs/<run_id>/
 ragent tui                        # three-pane interactive UI
 ```
@@ -66,10 +79,10 @@ ragent tui                        # three-pane interactive UI
 graph, its Mermaid rendering, the usage ledger status line, and the audit result:
 
 ```
-chapter 1/6 01-front-matter.md
-+2 nodes +1 edges (total 10/8)
-chapter 2/6 02-introduction.md
-+0 nodes +0 edges (total 10/8)
+chapter 1/6 ch01-introduction.md
++2 nodes +2 edges (total 10/9)
+chapter 2/6 ch02-literature-review.md
++0 nodes +0 edges (total 10/9)
 ...
 graph: .ragent/graph.json
 mermaid: .ragent/graph.mmd
@@ -91,8 +104,11 @@ Everything `ragent` writes lives under the configured `workspace` (default `.rag
 
 ```text
 .ragent/
-  skills/SKILL.md                          # synthesized end-to-end procedure
-  skills/chapters/<NN>-<slug>.md           # one distilled chapter per source section
+  skills/<name>/SKILL.md                   # upstream-generated skill entry point
+  skills/<name>/chapters/ch<NN>-<slug>.md   # upstream chapter artifacts
+  skills/<name>/glossary.md                # supporting summaries, not graph inputs
+  skills/<name>/patterns.md
+  skills/<name>/cheatsheet.md
   graph.json                               # current compiled+audited stage graph
   graph.mmd                                # Mermaid rendering of graph.json
   graph.rejected.json                      # last build that failed audit (only written on failure)
@@ -123,7 +139,7 @@ Everything `ragent` writes lives under the configured `workspace` (default `.rag
 
 Global CLI flags: `--config PATH`, `--workspace PATH`, repeatable `--model role=provider/model`.
 
-Seven roles are required — `book_to_skill`, `graph_builder`, `executor`, `report`, `obsidian`,
+Six roles are required — `graph_builder`, `executor`, `report`, `obsidian`,
 `refiner`, and `judge`. Each role has `provider`, `model`, `temperature`, `max_tokens`, and optional
 `reasoning_max_tokens`; an explicit reasoning cap must be positive and smaller than `max_tokens`.
 Missing roles and unknown providers are configuration errors.
@@ -132,12 +148,20 @@ Missing roles and unknown providers are configuration errors.
 `openrouter` / `anthropic/claude-sonnet-4.5`, `temperature = 0.2`, `max_tokens = 8192`.
 
 **This repo's checked-in `ragent.toml`**: every role routes to `openrouter` /
-`z-ai/glm-5.3-flash`. `book_to_skill` and `graph_builder` additionally set `max_tokens = 16384` and
-`temperature = 0.1` — the file's own comment explains why: `glm-5.3-flash` is a reasoning model that
-spends completion tokens on chain-of-thought before the real chapter/JSON output; the largest chapter
-in the bundled test PDF (17.8k source chars) needed 10.5k completion tokens, so 8192 measured empty
-output and 16384 gives headroom. `executor`, `report`, `obsidian`, `refiner`, `judge` only override
-`provider`/`model` in the checked-in file and inherit the default `temperature`/`max_tokens`.
+`z-ai/glm-5.3-flash`. `graph_builder` additionally sets `max_tokens = 16384` and
+`temperature = 0.1`. Other roles inherit the default `temperature`/`max_tokens`.
+
+PDF conversion is configured separately, not as an LLM role:
+
+```toml
+[book]
+agent = ["hermes", "--skills", "book-to-skill", "-z", "{prompt}"]
+```
+
+`{prompt}` is replaced with the `/book-to-skill` request and pre-answered conversion
+questions. The upstream skill must already be installed in that host. Other host
+agents require changing this command; ragent passes its interpreter as `PYTHON_BIN`,
+prepends its directory to `PATH`, and disables optional extractor-package installs.
 
 **Illustrative multi-provider example** — mix providers per role, e.g. to keep the judge on a
 cheaper/different model than the executor:
@@ -169,7 +193,7 @@ Other config sections:
 [research]
 query = "Optional reusable query"
 graph_path = ".ragent/graph.json"
-skill_path = ".ragent/skills/SKILL.md"
+skill_path = ".ragent/skills/paper/SKILL.md"
 instructions = "Review-specific requirements"
 min_sources = 6
 max_steps = 24
@@ -222,8 +246,8 @@ ragent --model executor=openai/gpt-5-mini research "query"
 |---|---|---|
 | `ragent init` | — | Writes `ragent.toml` (if absent), `.env.example`, and `skills/`, `runs/`, `graph_versions/`, `refine/` under the workspace. |
 | `ragent providers check` | — | Pings every configured provider's `/models` endpoint; prints provider status and a role → provider/model table; exits 1 if any provider failed. |
-| `ragent book PDF` | `--out PATH`, `--force` | Extracts + segments the PDF and distills it into `skills/SKILL.md` + `skills/chapters/*.md`. `--force` bypasses the per-chapter and SKILL.md caches. |
-| `ragent graph build` | `--skill-dir PATH`, `--out PATH`, `--no-extend` | Merges `skills/chapters/*.md` onto the seed graph; `--no-extend` returns the unmodified 8-node seed with no LLM calls. Writes `graph.json` + `graph.mmd`, or `graph.rejected.json` on audit failure. Exits 1 if the final audit fails. |
+| `ragent book PDF` | `--out PATH` (skills root), `--name SLUG` (source stem), `--mode text\|technical` (`text`), `--depth study\|reference` (`study`), `--force` | Runs upstream conversion via `[book].agent`, writing `<out>/<name>/`. Complete existing output is cached; incomplete output fails. `--force` deletes and regenerates that named skill. |
+| `ragent graph build` | `--skill-dir PATH`, `--out PATH`, `--no-extend` | Compiles upstream `chapters/ch<NN>-*.md` in numeric order. Defaults to the sole generated skill under `skills/`; multiple skills require `--skill-dir`. Supporting files are validated but not compiled. `--no-extend` needs no skill or LLM. Writes `graph.json` + `graph.mmd`, or `graph.rejected.json` on audit failure. |
 | `ragent graph show` | `--node TEXT`, `--graph PATH` | Prints a tree of one node (or all nodes) with its outward edges and their metrics. |
 | `ragent graph audit` | `--graph PATH` | Re-runs the soundness audit on a saved graph; exits 1 on failure. |
 | `ragent research [QUERY]` | `--graph PATH`, `--start TEXT`, `--max-steps N`, `--report/--no-report`, `--obsidian/--no-obsidian`, `--preflight` | Resolves omitted values from `[research]`. `--preflight` performs graph/route/skill/credential/model/price/budget/vault checks without creating a run, invoking inference, or writing notes. |
@@ -267,7 +291,9 @@ See [algorithm.md](docs/algorithm.md) for exactly how `research` walks the graph
 
 ### TUI screenshots
 
-Selecting an edge exposes its gate, retry behavior, context, tools, and prompt:
+Historical screenshots below predate the six-role host-agent cutover; the current
+role table excludes `book_to_skill`. Selecting an edge exposes its gate, retry
+behavior, context, tools, and prompt:
 
 ![TUI graph with the frame_goal edge selected and its details visible](docs/assets/tui-edge-detail.svg)
 
@@ -280,8 +306,8 @@ Key bindings:
 | Key | Action | Behavior |
 |---|---|---|
 | `r` | Run | Reads `#query` as the research query. A leading `/` logs `slash commands run on Enter, not r` instead of running. Empty input logs `enter a research query`. |
-| `b` | Book | Treats `#query` as a PDF path and runs book distillation *without* progress streaming. A missing/invalid path logs `Book binding uses the query field as a PDF path`. |
-| `g` | Build graph | Rebuilds `graph.json` from `skills/` with no progress streaming. Unlike the CLI, this writes no `graph.mmd` and prints no audit. |
+| `b` | Book | Treats `#query` as a PDF path, runs upstream conversion with streamed host output, and displays the generated `SKILL.md`. A missing/invalid path logs `Book binding uses the query field as a PDF path`. |
+| `g` | Build graph | Rebuilds `graph.json` from the sole generated skill under `skills/` with no progress streaming. Unlike the CLI, this writes no `graph.mmd` and prints no audit. |
 | `p` | Book→Graph | Runs the full book→graph pipeline, but only if `#query` already holds a PDF path; otherwise logs `pipeline: type /book <pdf-path> and press Enter`. |
 | `a` | Audit | Audits the currently loaded (or seed) graph and logs every finding. |
 | `u` | Budget | Toggles the `#breakdown` table and refreshes it. |
@@ -294,7 +320,8 @@ highlight, `tab` completes the highlighted command into the query box,
 `escape` dismisses it, clicking an entry completes it, and `enter` still
 submits.
 
-- `/book <pdf-path>` — runs the full book→graph pipeline with live per-chapter log lines. The graph
+- `/book <pdf-path>` — runs upstream conversion with streamed host output, then compiles
+  its `chapters/ch<NN>-*.md` files with live per-chapter log lines. The graph
   tree resets to the seed and grows live as each `graph_delta` arrives. On completion it writes
   `graph.json` (or `graph.rejected.json` if the audit fails), always writes `graph.mmd`, and shows
   the Mermaid source in the artifact pane. The path is split on whitespace (`raw.split()`), so paths

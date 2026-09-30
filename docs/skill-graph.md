@@ -252,10 +252,11 @@ are spent on a graph that cannot finish.
 
 ## 2.5 Extending the graph
 
-Chapters distilled from a source document (see
-[book-to-skill.md](book-to-skill.md)) are merged into the seed graph rather
-than building a separate graph per chapter. Three properties of that merge
-keep the result auditable:
+Upstream `book-to-skill` chapters (`chapters/ch<NN>-*.md`; see
+[book-to-skill.md](book-to-skill.md)) are compiled in numeric chapter order and
+merged into the seed graph rather than building a separate graph per chapter.
+The skill entry point and supporting summaries are validated but not compiled.
+Three properties of that merge keep the result auditable:
 
 - **Seed id reuse.** Node and edge ids produced from chapter text are passed
   through `slug_id`, and a proposed node is only added if its normalized id
@@ -266,8 +267,8 @@ keep the result auditable:
   independent one.
 - **Provenance tagging.** Every node or edge that is *not* part of the seed
   carries `provenance = {"chapter": ..., "cue": ...}`, recording which
-  chapter file and which literal sequencing/precondition cue (e.g. "then",
-  "if") produced it. Seed nodes/edges have no `provenance` (see §2.2).
+  chapter file (for example `ch01-introduction.md`) and which exact phrase
+  produced it. Seed nodes/edges have no `provenance` (see §2.2).
 - **Deterministic pruning.** After each chapter's additions are merged, the
   graph is re-audited, and any newly added node this chapter is responsible
   for that the audit flags as `dead_end`, `unreachable`, or
